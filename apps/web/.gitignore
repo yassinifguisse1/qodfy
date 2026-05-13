@@ -10,6 +10,9 @@
 !.yarn/releases
 !.yarn/versions
 
+# AI assistant local instruction files
+CLAUDE.md
+AGENTS.md
 # testing
 /coverage
 
