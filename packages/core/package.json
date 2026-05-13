@@ -1,0 +1,20 @@
+{
+    "name": "@qodfy/core",
+    "version": "0.0.1",
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "scripts": {
+      "build": "tsup src/index.ts --format esm --dts --clean",
+      "dev": "tsx src/index.ts"
+    },
+    "dependencies": {
+      "fast-glob": "latest"
+    },
+    "devDependencies": {
+      "@types/node": "latest",
+      "tsup": "latest",
+      "tsx": "latest",
+      "typescript": "latest"
+    }
+  }
