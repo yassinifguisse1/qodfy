@@ -1,97 +1,67 @@
+<div align="center">
+
 # Qodfy
 
-**Open-source launch readiness scanner for AI-built apps.**
+### Open-source launch readiness scanner for AI-built apps.
 
-Qodfy helps developers scan AI-built Next.js apps for unsafe routes, missing environment setup, duplicated code, messy structure, AI route risks, and launch blockers.
+AI helped you build fast. **Qodfy checks if it’s ready.**
+
+<br />
 
 ```bash
 npx qodfy scan
 ```
 
-> AI built it fast. Qodfy checks if it’s ready.
+<br />
+
+![Status](https://img.shields.io/badge/status-early_development-orange)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Built with TypeScript](https://img.shields.io/badge/built_with-TypeScript-3178c6)
+![Next.js](https://img.shields.io/badge/focused_on-Next.js-black)
+
+</div>
 
 ---
 
-## Why Qodfy?
+## What is Qodfy?
 
-AI coding tools make it easier than ever to build apps quickly.
+**Qodfy** is an open-source CLI that scans AI-built Next.js apps for common launch risks, messy code patterns, unsafe routes, missing setup, and production blockers.
 
-But fast-generated codebases often come with hidden problems:
+It is designed for developers building with tools like Cursor, Claude Code, v0, Lovable, Bolt, Replit, Vercel AI SDK, and other AI coding workflows.
 
-- missing environment setup
+```txt
+AI builds fast.
+Qodfy helps you clean, check, and ship safely.
+```
+
+---
+
+## Why Qodfy exists
+
+AI coding tools make it easy to generate apps quickly.
+
+But fast-generated codebases often hide problems:
+
+- missing `.env.example` files
 - unsafe API routes
 - AI endpoints without rate limiting
 - missing authentication checks
 - large generated files
-- messy structure
-- launch blockers
+- messy project structure
 - unclear production readiness
+- launch blockers that are easy to miss
 
-Qodfy gives developers a quick local report before they continue building or ship to production.
-
----
-
-## Current Status
-
-Qodfy is in early development.
-
-The first version focuses on:
-
-- Next.js apps
-- TypeScript / JavaScript projects
-- local CLI scanning
-- launch readiness scoring
-- basic AI route risk detection
+Qodfy gives you a quick local report before you continue building or ship to production.
 
 ---
 
-## Features
+## Example
 
-### Project Detection
-
-Qodfy checks if the scanned project is a Next.js app.
-
-### Environment Check
-
-Detects missing `.env.example` files.
-
-### API Route Check
-
-Scans API routes inside:
-
-```txt
-app/api/
-pages/api/
+```bash
+qodfy scan
 ```
 
-and warns when routes may be missing authentication checks.
-
-### AI Route Check
-
-Detects files using AI-related keywords such as:
-
-```txt
-openai
-@ai-sdk
-anthropic
-gemini
-generateText
-streamText
-```
-
-and warns when AI routes may be missing rate limiting.
-
-### Large File Detection
-
-Finds large files that may be difficult to maintain, especially in AI-generated codebases.
-
-### Launch Readiness Score
-
-Generates a simple score from `0` to `100` based on critical issues and warnings.
-
----
-
-## Example Output
+Output:
 
 ```txt
 Qodfy is scanning your project...
@@ -117,23 +87,64 @@ Fix critical issues first, then warnings, then cleanup items.
 
 ---
 
-## Monorepo Structure
+## Features
+
+| Feature | Status | Description |
+|---|---:|---|
+| Next.js detection | ✅ | Checks whether the scanned project is a Next.js app |
+| Environment checks | ✅ | Detects missing `.env.example` files |
+| API route scanning | ✅ | Finds API routes inside `app/api` and `pages/api` |
+| Auth risk detection | ✅ | Warns when API routes may be missing auth/session checks |
+| AI route detection | ✅ | Detects AI-related files using OpenAI, AI SDK, Anthropic, Gemini, and similar patterns |
+| Rate limit warnings | ✅ | Warns when AI routes may be missing rate limiting |
+| Large file detection | ✅ | Finds files that may be hard to maintain |
+| Launch readiness score | ✅ | Generates a simple score from `0` to `100` |
+| Markdown reports | Planned | Export scan results as Markdown |
+| JSON reports | Planned | Export scan results for integrations |
+| GitHub Action | Planned | Scan pull requests automatically |
+| Dashboard | Future | Track scans, history, teams, and reports |
+
+---
+
+## Current focus
+
+Qodfy is currently focused on:
+
+```txt
+Next.js apps
+TypeScript / JavaScript projects
+AI-built codebases
+local CLI scanning
+launch readiness checks
+```
+
+This project is still early. The first goal is to make one command useful:
+
+```bash
+qodfy scan
+```
+
+---
+
+## Monorepo structure
 
 ```txt
 qodfy/
   apps/
     web/              # Website, docs, and future dashboard
+
   packages/
     cli/              # CLI package: qodfy
     core/             # Scanner engine
     rules/            # Future reusable scan rules
     reporter/         # Future report formatters
+
   examples/           # Future example apps
 ```
 
 ---
 
-## Local Development
+## Local development
 
 Install dependencies:
 
@@ -161,31 +172,38 @@ pnpm build
 
 ---
 
-## CLI Development
+## Development commands
 
-The CLI package lives in:
+| Command | Description |
+|---|---|
+| `pnpm dev` | Run the Qodfy website |
+| `pnpm dev:cli` | Run the CLI locally against `apps/web` |
+| `pnpm build` | Build all packages |
+| `pnpm lint` | Run lint checks |
+
+---
+
+## How Qodfy scores a project
+
+Qodfy starts with a score of `100`.
+
+Then it reduces the score based on issues found:
 
 ```txt
-packages/cli
+Critical issue: -20 points
+Warning:        -8 points
+Info:           no major score penalty
 ```
 
-The scanner engine lives in:
+Example:
 
 ```txt
-packages/core
+100
+- 8  missing .env.example
+= 92/100
 ```
 
-Current local test command:
-
-```bash
-pnpm dev:cli
-```
-
-Future public command:
-
-```bash
-npx qodfy scan
-```
+The score is simple for now and will improve as Qodfy adds more rules.
 
 ---
 
@@ -212,6 +230,7 @@ npx qodfy scan
 - [ ] Detect missing rate limits more accurately
 - [ ] Detect missing tests
 - [ ] Improve Next.js App Router checks
+- [ ] Add better issue categories
 
 ### Future
 
@@ -230,12 +249,24 @@ npx qodfy scan
 
 Qodfy aims to become the cleanup and launch-readiness layer for AI-built apps.
 
-AI tools help developers build fast.
+Developers are building faster than ever with AI.
 
-Qodfy helps them check, clean, secure, and ship safely.
+Qodfy helps them answer one important question:
+
+```txt
+Is this app actually ready to ship?
+```
 
 ---
 
 ## License
 
 MIT
+
+---
+
+<div align="center">
+
+Built for developers shipping AI-generated apps.
+
+</div>
