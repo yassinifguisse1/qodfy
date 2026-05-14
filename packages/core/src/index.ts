@@ -38,6 +38,19 @@ type SafeStatResult =
   | { ok: true; size: number }
   | { ok: false; reason: string; code?: string };
 
+type WebhookProvider =
+  | "stripe"
+  | "clerk"
+  | "github"
+  | "shopify"
+  | "resend"
+  | "unknown";
+
+type WebhookRouteInfo = {
+  provider: WebhookProvider;
+  confidence: "high" | "likely";
+};
+
 const sourceFilePatterns = ["**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"];
 
 const ignoredPaths = [
@@ -309,28 +322,20 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       }
     }
 
-    const isStripeWebhook = isStripeWebhookRoute(relativeFile, content);
-    const hasStripeSignatureVerification = hasStripeWebhookSignatureVerification(content);
-    const isClerkWebhook = isClerkWebhookRoute(relativeFile, content);
-    const hasClerkSignatureVerification = hasClerkWebhookSignatureVerification(content);
+    const webhookRouteInfo = apiRouteSet.has(file)
+      ? getWebhookRouteInfo(relativeFile, content)
+      : null;
 
-    if (isStripeWebhook && !hasStripeSignatureVerification) {
+    if (
+      webhookRouteInfo &&
+      !hasWebhookSignatureVerification(content, webhookRouteInfo.provider)
+    ) {
       issues.push({
-        severity: "critical",
-        title: "Stripe webhook may be missing signature verification",
-        message: "This Stripe webhook route does not appear to verify the Stripe signature before handling the event.",
+        severity: webhookRouteInfo.confidence === "high" ? "critical" : "warning",
+        title: "Webhook route may be missing signature verification",
+        message: "This webhook route appears to handle external events, but Qodfy could not find signature verification before the event is handled.",
         file: relativeFile,
-        suggestion: "Use stripe.webhooks.constructEvent with the raw request body, Stripe-Signature header, and STRIPE_WEBHOOK_SECRET."
-      });
-    }
-
-    if (isClerkWebhook && !hasClerkSignatureVerification) {
-      issues.push({
-        severity: "critical",
-        title: "Clerk webhook may be missing signature verification",
-        message: "This Clerk webhook route does not appear to verify the webhook signature before handling the event.",
-        file: relativeFile,
-        suggestion: "Use svix Webhook(...).verify(...) with CLERK_WEBHOOK_SECRET and Clerk webhook headers."
+        suggestion: getWebhookSignatureSuggestion(webhookRouteInfo.provider)
       });
     }
 
@@ -360,7 +365,7 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
         content.includes("clerkClient") ||
         content.includes("session");
 
-      if (!hasAuth && !isStripeWebhook && !isClerkWebhook) {
+      if (!hasAuth && !webhookRouteInfo) {
         issues.push({
           severity: "warning",
           title: "API route may be missing authentication",
@@ -689,56 +694,209 @@ function isClientSideFile(relativeFile: string, content: string) {
 }
 
 function isApiRoute(filePath: string) {
+  const normalizedFile = normalizePath(filePath);
+  const sourceFileExtension = "(?:ts|tsx|js|jsx|mts|cts|mjs|cjs)";
+
   return (
-    filePath.includes(`${path.sep}app${path.sep}api${path.sep}`) ||
-    filePath.includes(`${path.sep}pages${path.sep}api${path.sep}`)
+    new RegExp(`/app/api(?:/.+)?/route\\.${sourceFileExtension}$`).test(normalizedFile) ||
+    new RegExp(`/pages/api/.+\\.${sourceFileExtension}$`).test(normalizedFile)
   );
 }
 
-function isStripeWebhookRoute(relativeFile: string, content: string) {
+function getWebhookRouteInfo(relativeFile: string, content: string): WebhookRouteInfo | null {
   const normalizedFile = relativeFile.toLowerCase();
   const normalizedContent = content.toLowerCase();
+  const normalizedRouteContext = `${normalizedFile}\n${normalizedContent}`;
 
-  return (
-    normalizedContent.includes("stripe") &&
+  const pathLooksLikeWebhook =
+    normalizedFile.includes("webhook") ||
+    normalizedFile.includes("callback");
+  const contentStronglySuggestsWebhook =
+    normalizedContent.includes("stripe.webhooks") ||
+    normalizedContent.includes("constructevent(") ||
+    normalizedContent.includes("stripe-signature") ||
+    normalizedContent.includes("stripe_webhook_secret") ||
+    normalizedContent.includes("clerk_webhook_secret") ||
+    normalizedContent.includes("svix") ||
+    normalizedContent.includes("x-github-event") ||
+    normalizedContent.includes("x-hub-signature") ||
+    normalizedContent.includes("x-shopify-hmac-sha256") ||
     (
-      normalizedFile.includes("webhook") ||
-      normalizedContent.includes("webhook") ||
-      normalizedContent.includes("stripe.webhooks")
-    )
-  );
-}
-
-function hasStripeWebhookSignatureVerification(content: string) {
-  return (
-    content.includes("stripe.webhooks.constructEvent") ||
-    content.includes("webhooks.constructEvent") ||
-    content.includes("constructEvent(")
-  );
-}
-
-function isClerkWebhookRoute(relativeFile: string, content: string) {
-  const normalizedFile = relativeFile.toLowerCase();
-  const normalizedContent = content.toLowerCase();
-
-  return (
-    (
-      normalizedContent.includes("clerk") ||
-      normalizedContent.includes("clerk_webhook_secret")
-    ) &&
-    (
-      normalizedFile.includes("webhook") ||
+      normalizedContent.includes("resend") &&
       normalizedContent.includes("webhook")
+    ) ||
+    normalizedContent.includes("webhook_secret") ||
+    normalizedContent.includes("webhooksecret") ||
+    (
+      normalizedContent.includes("webhook") &&
+      (
+        normalizedContent.includes("signature") ||
+        normalizedContent.includes("secret") ||
+        normalizedContent.includes("event")
+      )
+    );
+
+  if (!pathLooksLikeWebhook && !contentStronglySuggestsWebhook) {
+    return null;
+  }
+
+  const provider = getWebhookProvider(normalizedRouteContext);
+
+  return {
+    provider,
+    confidence: provider === "unknown" ? "likely" : "high"
+  };
+}
+
+function getWebhookProvider(normalizedRouteContext: string): WebhookProvider {
+  if (
+    normalizedRouteContext.includes("stripe-signature") ||
+    normalizedRouteContext.includes("stripe_webhook_secret") ||
+    normalizedRouteContext.includes("stripe.webhooks") ||
+    normalizedRouteContext.includes("constructevent(") ||
+    (
+      normalizedRouteContext.includes("stripe") &&
+      normalizedRouteContext.includes("webhook")
+    )
+  ) {
+    return "stripe";
+  }
+
+  if (
+    normalizedRouteContext.includes("resend") &&
+    normalizedRouteContext.includes("webhook")
+  ) {
+    return "resend";
+  }
+
+  if (
+    normalizedRouteContext.includes("clerk_webhook_secret") ||
+    (
+      normalizedRouteContext.includes("clerk") &&
+      normalizedRouteContext.includes("webhook")
+    )
+  ) {
+    return "clerk";
+  }
+
+  if (
+    normalizedRouteContext.includes("x-github-event") ||
+    normalizedRouteContext.includes("x-hub-signature")
+  ) {
+    return "github";
+  }
+
+  if (normalizedRouteContext.includes("x-shopify-hmac-sha256")) {
+    return "shopify";
+  }
+
+  return "unknown";
+}
+
+function hasWebhookSignatureVerification(content: string, provider: WebhookProvider) {
+  const normalizedContent = content.toLowerCase();
+
+  if (provider === "stripe") {
+    return (
+      normalizedContent.includes("stripe.webhooks.constructevent") ||
+      normalizedContent.includes("webhooks.constructevent") ||
+      normalizedContent.includes("constructevent(")
+    );
+  }
+
+  if (provider === "clerk") {
+    return (
+      (
+        normalizedContent.includes("new webhook(") ||
+        normalizedContent.includes("webhook(") ||
+        normalizedContent.includes("svix")
+      ) &&
+      (
+        normalizedContent.includes(".verify(") ||
+        normalizedContent.includes("verify(") ||
+        normalizedContent.includes("verifywebhook")
+      )
+    );
+  }
+
+  if (provider === "github") {
+    return (
+      (
+        normalizedContent.includes("x-hub-signature") ||
+        normalizedContent.includes("x-hub-signature-256")
+      ) &&
+      hasHmacOrVerifyCall(normalizedContent)
+    );
+  }
+
+  if (provider === "shopify") {
+    return (
+      normalizedContent.includes("x-shopify-hmac-sha256") &&
+      hasHmacOrVerifyCall(normalizedContent)
+    );
+  }
+
+  if (provider === "resend") {
+    return (
+      normalizedContent.includes("verifywebhook") ||
+      (
+        (
+          normalizedContent.includes("new webhook(") ||
+          normalizedContent.includes("webhook(") ||
+          normalizedContent.includes("svix")
+        ) &&
+        hasHmacOrVerifyCall(normalizedContent)
+      )
+    );
+  }
+
+  return (
+    normalizedContent.includes("constructevent(") ||
+    normalizedContent.includes("verifywebhook") ||
+    (
+      normalizedContent.includes("signature") &&
+      hasHmacOrVerifyCall(normalizedContent)
+    ) ||
+    (
+      normalizedContent.includes("webhook") &&
+      normalizedContent.includes("verify(")
     )
   );
 }
 
-function hasClerkWebhookSignatureVerification(content: string) {
+function hasHmacOrVerifyCall(normalizedContent: string) {
   return (
-    content.includes("new Webhook(") ||
-    content.includes(".verify(") ||
-    content.includes("svix")
+    normalizedContent.includes("verify(") ||
+    normalizedContent.includes(".verify(") ||
+    normalizedContent.includes("verifywebhook") ||
+    normalizedContent.includes("createhmac") ||
+    normalizedContent.includes("timingsafeequal") ||
+    normalizedContent.includes("subtle.verify")
   );
+}
+
+function getWebhookSignatureSuggestion(provider: WebhookProvider) {
+  if (provider === "stripe") {
+    return "Use stripe.webhooks.constructEvent(...) with the Stripe signature header before handling the event.";
+  }
+
+  if (provider === "clerk") {
+    return "Verify the event with Svix before handling it.";
+  }
+
+  if (provider === "github") {
+    return "Verify the GitHub signature using the raw request body, X-Hub-Signature-256 header, and webhook secret.";
+  }
+
+  if (provider === "shopify") {
+    return "Verify the Shopify HMAC using the raw request body, X-Shopify-Hmac-Sha256 header, and webhook secret.";
+  }
+
+  if (provider === "resend") {
+    return "Verify the Resend webhook signature before handling the event.";
+  }
+
+  return "Verify the provider signature using the raw request body and signature header before trusting the event.";
 }
 
 function isPackageJsonObject(data: unknown): data is {
