@@ -6,12 +6,10 @@ import { scanProject } from "@qodfy/core";
 
 const program = new Command();
 
-
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.1.0");
-
+  .version("0.1.1");
 
 program
   .command("scan")
@@ -25,7 +23,6 @@ program
     printReport(report);
   });
 
-  
 program.parse();
 
 function printReport(report: Awaited<ReturnType<typeof scanProject>>) {

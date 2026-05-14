@@ -1,6 +1,6 @@
 {
   "name": "@qodfy/core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Scanner engine for Qodfy, an open-source launch readiness scanner for AI-built apps.",
   "keywords": [
     "qodfy",
