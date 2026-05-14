@@ -80,6 +80,17 @@ const aiKeywords = [
   "useChat"
 ];
 
+const ignoredEnvVariables = new Set([
+  "CI",
+  "HOME",
+  "NODE_ENV",
+  "PORT",
+  "PWD",
+  "VERCEL",
+  "VERCEL_ENV",
+  "VERCEL_URL"
+]);
+
 const hardcodedSecretPatterns = [
   {
     label: "OpenAI API key",
@@ -115,7 +126,8 @@ const hardcodedSecretPatterns = [
   }
 ];
 
-const LARGE_FILE_WARNING_BYTES = 15000;
+const LARGE_FILE_WARNING_BYTES = 40 * 1024;
+const LARGE_FILE_REPORT_LIMIT = 10;
 const MAX_FILE_SIZE_BYTES = 500 * 1024;
 
 export async function scanProject(projectPath: string): Promise<ScanReport> {
@@ -217,9 +229,10 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
   });
   const apiRouteSet = new Set(apiRoutes);
 
-  const envExampleWarningKeys = new Set<string>();
+  const missingEnvUsages = new Map<string, Set<string>>();
   const clientSecretWarningKeys = new Set<string>();
   const hardcodedSecretWarningKeys = new Set<string>();
+  const largeFileCandidates: Array<{ relativeFile: string; size: number }> = [];
   let aiFiles = 0;
   let largeFiles = 0;
 
@@ -266,13 +279,9 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
 
     if (statResult.size > LARGE_FILE_WARNING_BYTES) {
       largeFiles++;
-
-      issues.push({
-        severity: "info",
-        title: "Large file detected",
-        message: "Large files are harder to maintain and often appear in AI-generated codebases.",
-        file: relativeFile,
-        suggestion: "Consider splitting this file into smaller modules if it mixes unrelated responsibilities."
+      largeFileCandidates.push({
+        relativeFile,
+        size: statResult.size
       });
     }
 
@@ -302,6 +311,8 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
 
     const isStripeWebhook = isStripeWebhookRoute(relativeFile, content);
     const hasStripeSignatureVerification = hasStripeWebhookSignatureVerification(content);
+    const isClerkWebhook = isClerkWebhookRoute(relativeFile, content);
+    const hasClerkSignatureVerification = hasClerkWebhookSignatureVerification(content);
 
     if (isStripeWebhook && !hasStripeSignatureVerification) {
       issues.push({
@@ -310,6 +321,16 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
         message: "This Stripe webhook route does not appear to verify the Stripe signature before handling the event.",
         file: relativeFile,
         suggestion: "Use stripe.webhooks.constructEvent with the raw request body, Stripe-Signature header, and STRIPE_WEBHOOK_SECRET."
+      });
+    }
+
+    if (isClerkWebhook && !hasClerkSignatureVerification) {
+      issues.push({
+        severity: "critical",
+        title: "Clerk webhook may be missing signature verification",
+        message: "This Clerk webhook route does not appear to verify the webhook signature before handling the event.",
+        file: relativeFile,
+        suggestion: "Use svix Webhook(...).verify(...) with CLERK_WEBHOOK_SECRET and Clerk webhook headers."
       });
     }
 
@@ -339,7 +360,7 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
         content.includes("clerkClient") ||
         content.includes("session");
 
-      if (!hasAuth && !isStripeWebhook) {
+      if (!hasAuth && !isStripeWebhook && !isClerkWebhook) {
         issues.push({
           severity: "warning",
           title: "API route may be missing authentication",
@@ -354,29 +375,19 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
 
     if (envExampleVariables) {
       for (const variableName of usedEnvVariables) {
-        if (!envExampleVariables.has(variableName)) {
-          const warningKey = `${relativeFile}:${variableName}`;
-
-          if (envExampleWarningKeys.has(warningKey)) {
-            continue;
-          }
-
-          envExampleWarningKeys.add(warningKey);
-
-          issues.push({
-            severity: "warning",
-            title: "Environment variable missing from .env.example",
-            message: `${variableName} is used in ${relativeFile} but is not documented in .env.example.`,
-            file: relativeFile,
-            suggestion: `Add ${variableName}= to .env.example without including a real value.`
-          });
+        if (shouldIgnoreEnvVariable(variableName) || envExampleVariables.has(variableName)) {
+          continue;
         }
+
+        const filesUsingVariable = missingEnvUsages.get(variableName) ?? new Set<string>();
+        filesUsingVariable.add(relativeFile);
+        missingEnvUsages.set(variableName, filesUsingVariable);
       }
     }
 
     if (isClientSideFile(relativeFile, content)) {
       for (const variableName of usedEnvVariables) {
-        if (!variableName.startsWith("NEXT_PUBLIC_")) {
+        if (!variableName.startsWith("NEXT_PUBLIC_") && !shouldIgnoreEnvVariable(variableName)) {
           const warningKey = `${relativeFile}:${variableName}`;
 
           if (clientSecretWarningKeys.has(warningKey)) {
@@ -397,10 +408,33 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     }
   }
 
+  for (const largeFile of getReportedLargeFiles(largeFileCandidates)) {
+    issues.push({
+      severity: "info",
+      title: "Large file detected",
+      message: "Large files are harder to maintain and often appear in AI-generated codebases.",
+      file: largeFile.relativeFile,
+      suggestion: "Consider splitting this file into smaller modules if it mixes unrelated responsibilities."
+    });
+  }
+
+  for (const [variableName, filesUsingVariable] of getSortedMissingEnvUsages(missingEnvUsages)) {
+    const files = [...filesUsingVariable].sort();
+
+    issues.push({
+      severity: "warning",
+      title: "Environment variable missing from .env.example",
+      message: getMissingEnvMessage(variableName, files),
+      file: files.length === 1 ? files[0] : undefined,
+      suggestion: `Add ${variableName}= to .env.example without including a real value.`
+    });
+  }
+
   const criticalCount = issues.filter((issue) => issue.severity === "critical").length;
   const warningCount = issues.filter((issue) => issue.severity === "warning").length;
+  const warningPenalty = Math.min(warningCount * 5, 50);
 
-  const score = Math.max(0, 100 - criticalCount * 20 - warningCount * 8);
+  const score = Math.max(0, 100 - criticalCount * 20 - warningPenalty);
 
   return {
     projectPath: resolvedProjectPath,
@@ -578,6 +612,41 @@ function getUsedEnvVariables(content: string) {
   return variables;
 }
 
+function shouldIgnoreEnvVariable(variableName: string) {
+  return ignoredEnvVariables.has(variableName);
+}
+
+function getReportedLargeFiles(largeFileCandidates: Array<{ relativeFile: string; size: number }>) {
+  return [...largeFileCandidates]
+    .sort((a, b) => b.size - a.size)
+    .slice(0, LARGE_FILE_REPORT_LIMIT);
+}
+
+function getSortedMissingEnvUsages(missingEnvUsages: Map<string, Set<string>>) {
+  return [...missingEnvUsages.entries()].sort(([leftVariable], [rightVariable]) =>
+    leftVariable.localeCompare(rightVariable)
+  );
+}
+
+function getMissingEnvMessage(variableName: string, files: string[]) {
+  if (files.length === 1) {
+    return `${variableName} is used in ${files[0]} but is not documented in .env.example.`;
+  }
+
+  return `${variableName} is used in ${files.length} files but is not documented in .env.example. Files: ${formatFileList(files)}.`;
+}
+
+function formatFileList(files: string[]) {
+  const filesToShow = files.slice(0, 5);
+  const remainingCount = files.length - filesToShow.length;
+
+  if (remainingCount <= 0) {
+    return filesToShow.join(", ");
+  }
+
+  return `${filesToShow.join(", ")} and ${remainingCount} more`;
+}
+
 function parseDestructuredEnvNames(destructuredContent: string) {
   const variables: string[] = [];
 
@@ -645,6 +714,30 @@ function hasStripeWebhookSignatureVerification(content: string) {
     content.includes("stripe.webhooks.constructEvent") ||
     content.includes("webhooks.constructEvent") ||
     content.includes("constructEvent(")
+  );
+}
+
+function isClerkWebhookRoute(relativeFile: string, content: string) {
+  const normalizedFile = relativeFile.toLowerCase();
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    (
+      normalizedContent.includes("clerk") ||
+      normalizedContent.includes("clerk_webhook_secret")
+    ) &&
+    (
+      normalizedFile.includes("webhook") ||
+      normalizedContent.includes("webhook")
+    )
+  );
+}
+
+function hasClerkWebhookSignatureVerification(content: string) {
+  return (
+    content.includes("new Webhook(") ||
+    content.includes(".verify(") ||
+    content.includes("svix")
   );
 }
 

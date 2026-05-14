@@ -15,7 +15,7 @@ const program = new Command();
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.1.4");
+  .version("0.1.5");
 
 program
   .command("scan")
