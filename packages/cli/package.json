@@ -1,6 +1,6 @@
 {
   "name": "qodfy",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Open-source launch readiness scanner for AI-built apps.",
   "keywords": [
     "qodfy",
@@ -38,7 +38,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "license": "MIT",
   "engines": {
