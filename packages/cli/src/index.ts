@@ -2,14 +2,16 @@
 
 import { Command } from "commander";
 import pc from "picocolors";
-import { scanProject } from "@qodfy/core/src/index.ts";
+import { scanProject } from "@qodfy/core";
 
 const program = new Command();
+
 
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.0.1");
+  .version("0.1.0");
+
 
 program
   .command("scan")
@@ -23,6 +25,7 @@ program
     printReport(report);
   });
 
+  
 program.parse();
 
 function printReport(report: Awaited<ReturnType<typeof scanProject>>) {

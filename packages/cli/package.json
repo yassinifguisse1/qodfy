@@ -1,28 +1,66 @@
 {
-    "name": "qodfy",
-    "version": "0.0.1",
-    "description": "Open-source launch readiness scanner for AI-built apps.",
-    "type": "module",
-    "bin": {
-      "qodfy": "./dist/index.js"
-    },
-    "files": [
-      "dist"
-    ],
-    "scripts": {
-      "build": "tsup src/index.ts --format esm --dts --clean",
-      "dev": "tsx src/index.ts",
-      "start": "node dist/index.js"
-    },
-    "dependencies": {
-      "@qodfy/core": "workspace:*",
-      "commander": "latest",
-      "picocolors": "latest"
-    },
-    "devDependencies": {
-      "@types/node": "latest",
-      "tsup": "latest",
-      "tsx": "latest",
-      "typescript": "latest"
+  "name": "qodfy",
+  "version": "0.1.0",
+  "description": "Open-source launch readiness scanner for AI-built apps.",
+  "keywords": [
+    "qodfy",
+    "cli",
+    "nextjs",
+    "ai",
+    "ai-sdk",
+    "launch-readiness",
+    "scanner",
+    "code-quality",
+    "developer-tools",
+    "typescript",
+    "vercel"
+  ],
+  "homepage": "https://github.com/yassinifguisse1/qodfy#readme",
+  "bugs": {
+    "url": "https://github.com/yassinifguisse1/qodfy/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yassinifguisse1/qodfy.git",
+    "directory": "packages/cli"
+  },
+  "author": "Yassine Ifguisse",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "qodfy": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
+  },
+  "files": [
+    "dist"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean --tsconfig tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@qodfy/core": "workspace:^",
+    "commander": "^14.0.3",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
   }
+}

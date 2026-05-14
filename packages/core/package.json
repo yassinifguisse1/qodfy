@@ -1,20 +1,58 @@
 {
-    "name": "@qodfy/core",
-    "version": "0.0.1",
-    "type": "module",
-    "main": "./dist/index.js",
-    "types": "./dist/index.d.ts",
-    "scripts": {
-      "build": "tsup src/index.ts --format esm --dts --clean",
-      "dev": "tsx src/index.ts"
-    },
-    "dependencies": {
-      "fast-glob": "latest"
-    },
-    "devDependencies": {
-      "@types/node": "latest",
-      "tsup": "latest",
-      "tsx": "latest",
-      "typescript": "latest"
+  "name": "@qodfy/core",
+  "version": "0.1.0",
+  "description": "Scanner engine for Qodfy, an open-source launch readiness scanner for AI-built apps.",
+  "keywords": [
+    "qodfy",
+    "nextjs",
+    "ai",
+    "launch-readiness",
+    "scanner",
+    "code-quality",
+    "developer-tools",
+    "typescript",
+    "static-analysis"
+  ],
+  "homepage": "https://github.com/yassinifguisse1/qodfy#readme",
+  "bugs": {
+    "url": "https://github.com/yassinifguisse1/qodfy/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yassinifguisse1/qodfy.git",
+    "directory": "packages/core"
+  },
+  "author": "Yassine Ifguisse",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
+  },
+  "files": [
+    "dist"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean --tsconfig tsconfig.json",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "fast-glob": "^3.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
   }
+}
