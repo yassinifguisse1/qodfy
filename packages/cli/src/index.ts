@@ -15,13 +15,14 @@ const program = new Command();
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.1.2");
+  .version("0.1.4");
 
 program
   .command("scan")
   .description("Scan a project for launch readiness issues.")
   .option("-p, --path <path>", "Project path to scan", process.cwd())
-  .action(async (options: { path: string }) => {
+  .option("--max-issues <number>", "Maximum number of issues to display", "50")
+  .action(async (options: { path: string; maxIssues: string }) => {
     const pathResult = await resolveProjectPath(options.path);
 
     if (!pathResult.ok) {
@@ -35,7 +36,7 @@ program
 
       const report = await scanProject(pathResult.projectPath);
 
-      printReport(report);
+      printReport(report, parseMaxIssues(options.maxIssues));
     } catch (error) {
       printScanError(getErrorMessage(error));
       process.exitCode = 1;
@@ -86,7 +87,7 @@ async function resolveProjectPath(projectPath: string): Promise<PathValidationRe
   }
 }
 
-function printReport(report: Awaited<ReturnType<typeof scanProject>>) {
+function printReport(report: Awaited<ReturnType<typeof scanProject>>, maxIssues: number) {
   console.log(pc.bold("Qodfy Report"));
   console.log("");
 
@@ -103,6 +104,7 @@ function printReport(report: Awaited<ReturnType<typeof scanProject>>) {
   console.log(`API routes: ${report.stats.apiRoutes}`);
   console.log(`AI-related files: ${report.stats.aiFiles}`);
   console.log(`Large files: ${report.stats.largeFiles}`);
+  console.log(`Scan duration: ${formatDuration(report.stats.durationMs)}`);
   console.log("");
 
   if (report.issues.length === 0) {
@@ -111,8 +113,14 @@ function printReport(report: Awaited<ReturnType<typeof scanProject>>) {
   }
 
   console.log(pc.bold("Issues"));
+  const issuesToShow = report.issues.slice(0, maxIssues);
 
-  for (const issue of report.issues) {
+  if (report.issues.length > maxIssues) {
+    console.log(`Showing ${maxIssues} of ${report.issues.length} issues.`);
+    console.log(`Use --max-issues <number> to show more.`);
+  }
+
+  for (const issue of issuesToShow) {
     const label =
       issue.severity === "critical" ? pc.red("CRITICAL") :
       issue.severity === "warning" ? pc.yellow("WARNING") :
@@ -151,6 +159,24 @@ function getErrorMessage(error: unknown) {
   }
 
   return "An unexpected error occurred while scanning the project.";
+}
+
+function parseMaxIssues(maxIssues: string) {
+  const parsedMaxIssues = Number.parseInt(maxIssues, 10);
+
+  if (!Number.isFinite(parsedMaxIssues) || parsedMaxIssues <= 0) {
+    return 50;
+  }
+
+  return parsedMaxIssues;
+}
+
+function formatDuration(durationMs: number) {
+  if (durationMs < 1000) {
+    return `${durationMs}ms`;
+  }
+
+  return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
 function getErrorCode(error: unknown) {

@@ -22,6 +22,7 @@ export type ScanReport = {
     apiRoutes: number;
     aiFiles: number;
     largeFiles: number;
+    durationMs: number;
   };
 };
 
@@ -33,6 +34,10 @@ type SafeJsonResult =
   | { ok: true; data: unknown }
   | { ok: false; reason: string; code?: string };
 
+type SafeStatResult =
+  | { ok: true; size: number }
+  | { ok: false; reason: string; code?: string };
+
 const sourceFilePatterns = ["**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"];
 
 const ignoredPaths = [
@@ -41,7 +46,27 @@ const ignoredPaths = [
   "dist/**",
   "build/**",
   ".turbo/**",
-  ".vercel/**"
+  ".vercel/**",
+  "coverage/**",
+  "**/coverage/**",
+  ".cache/**",
+  "**/.cache/**",
+  ".output/**",
+  "**/.output/**",
+  ".open-next/**",
+  "**/.open-next/**",
+  "storybook-static/**",
+  "**/storybook-static/**",
+  "playwright-report/**",
+  "**/playwright-report/**",
+  "test-results/**",
+  "**/test-results/**",
+  "**/*.d.ts",
+  "**/*.map",
+  "generated/**",
+  "**/generated/**",
+  "__generated__/**",
+  "**/__generated__/**"
 ];
 
 const aiKeywords = [
@@ -55,7 +80,46 @@ const aiKeywords = [
   "useChat"
 ];
 
+const hardcodedSecretPatterns = [
+  {
+    label: "OpenAI API key",
+    pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g
+  },
+  {
+    label: "Stripe secret key",
+    pattern: /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g
+  },
+  {
+    label: "Stripe webhook secret",
+    pattern: /\bwhsec_[A-Za-z0-9]{16,}\b/g
+  },
+  {
+    label: "GitHub token",
+    pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{30,}\b/g
+  },
+  {
+    label: "GitHub fine-grained token",
+    pattern: /\bgithub_pat_[A-Za-z0-9_]{40,}\b/g
+  },
+  {
+    label: "Google API key",
+    pattern: /\bAIza[A-Za-z0-9_-]{20,}\b/g
+  },
+  {
+    label: "Slack token",
+    pattern: /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g
+  },
+  {
+    label: "private key",
+    pattern: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g
+  }
+];
+
+const LARGE_FILE_WARNING_BYTES = 15000;
+const MAX_FILE_SIZE_BYTES = 500 * 1024;
+
 export async function scanProject(projectPath: string): Promise<ScanReport> {
+  const startTime = Date.now();
   const resolvedProjectPath = path.resolve(projectPath);
   const issues: Issue[] = [];
 
@@ -149,22 +213,44 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
   const files = await getSourceFiles(resolvedProjectPath, issues);
 
   const apiRoutes = files.filter((file) => {
-    return (
-      file.includes(`${path.sep}app${path.sep}api${path.sep}`) ||
-      file.includes(`${path.sep}pages${path.sep}api${path.sep}`)
-    );
+    return isApiRoute(file);
   });
   const apiRouteSet = new Set(apiRoutes);
 
-  const readableFiles = new Map<string, string>();
   const envExampleWarningKeys = new Set<string>();
   const clientSecretWarningKeys = new Set<string>();
+  const hardcodedSecretWarningKeys = new Set<string>();
   let aiFiles = 0;
   let largeFiles = 0;
 
   for (const file of files) {
-    const fileResult = await safeReadFile(file);
     const relativeFile = normalizePath(path.relative(resolvedProjectPath, file));
+    const statResult = await safeStatFile(file);
+
+    if (!statResult.ok) {
+      issues.push({
+        severity: "info",
+        title: "File could not be checked",
+        message: statResult.reason,
+        file: relativeFile
+      });
+      continue;
+    }
+
+    if (statResult.size > MAX_FILE_SIZE_BYTES) {
+      largeFiles++;
+
+      issues.push({
+        severity: "info",
+        title: "Large file skipped from deep scan",
+        message: "This file is larger than 500KB and was skipped from deep content checks.",
+        file: relativeFile,
+        suggestion: "Review large generated or bundled files manually."
+      });
+      continue;
+    }
+
+    const fileResult = await safeReadFile(file);
 
     if (!fileResult.ok) {
       issues.push({
@@ -177,9 +263,8 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     }
 
     const content = fileResult.content;
-    readableFiles.set(file, content);
 
-    if (content.length > 15000) {
+    if (statResult.size > LARGE_FILE_WARNING_BYTES) {
       largeFiles++;
 
       issues.push({
@@ -211,6 +296,56 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
           message: "AI routes can create real API costs. Add rate limiting or usage limits before launch.",
           file: relativeFile,
           suggestion: "Add rate limiting, usage limits, or per-user quotas before launch."
+        });
+      }
+    }
+
+    const isStripeWebhook = isStripeWebhookRoute(relativeFile, content);
+    const hasStripeSignatureVerification = hasStripeWebhookSignatureVerification(content);
+
+    if (isStripeWebhook && !hasStripeSignatureVerification) {
+      issues.push({
+        severity: "critical",
+        title: "Stripe webhook may be missing signature verification",
+        message: "This Stripe webhook route does not appear to verify the Stripe signature before handling the event.",
+        file: relativeFile,
+        suggestion: "Use stripe.webhooks.constructEvent with the raw request body, Stripe-Signature header, and STRIPE_WEBHOOK_SECRET."
+      });
+    }
+
+    for (const secretMatch of getHardcodedSecretMatches(content)) {
+      const warningKey = `${relativeFile}:${secretMatch.label}`;
+
+      if (hardcodedSecretWarningKeys.has(warningKey)) {
+        continue;
+      }
+
+      hardcodedSecretWarningKeys.add(warningKey);
+
+      issues.push({
+        severity: "critical",
+        title: "Possible hardcoded secret",
+        message: `A string literal in ${relativeFile} matches the pattern for ${secretMatch.label}. Qodfy does not print possible secret values.`,
+        file: relativeFile,
+        suggestion: "Move secrets into environment variables and rotate the value if this is a real secret."
+      });
+    }
+
+    if (apiRouteSet.has(file)) {
+      const hasAuth =
+        content.includes("auth(") ||
+        content.includes("getServerSession") ||
+        content.includes("currentUser") ||
+        content.includes("clerkClient") ||
+        content.includes("session");
+
+      if (!hasAuth && !isStripeWebhook) {
+        issues.push({
+          severity: "warning",
+          title: "API route may be missing authentication",
+          message: "This API route does not appear to contain an auth/session check.",
+          file: relativeFile,
+          suggestion: "Confirm the route is public, or add an auth/session check before handling user data."
         });
       }
     }
@@ -262,33 +397,6 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     }
   }
 
-  for (const route of apiRoutes) {
-    const content = readableFiles.get(route);
-
-    if (!content) {
-      continue;
-    }
-
-    const relativeFile = normalizePath(path.relative(resolvedProjectPath, route));
-
-    const hasAuth =
-      content.includes("auth(") ||
-      content.includes("getServerSession") ||
-      content.includes("currentUser") ||
-      content.includes("clerkClient") ||
-      content.includes("session");
-
-    if (!hasAuth) {
-      issues.push({
-        severity: "warning",
-        title: "API route may be missing authentication",
-        message: "This API route does not appear to contain an auth/session check.",
-        file: relativeFile,
-        suggestion: "Confirm the route is public, or add an auth/session check before handling user data."
-      });
-    }
-  }
-
   const criticalCount = issues.filter((issue) => issue.severity === "critical").length;
   const warningCount = issues.filter((issue) => issue.severity === "warning").length;
 
@@ -303,7 +411,8 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       totalFiles: files.length,
       apiRoutes: apiRoutes.length,
       aiFiles,
-      largeFiles
+      largeFiles,
+      durationMs: Date.now() - startTime
     }
   };
 }
@@ -346,6 +455,41 @@ async function safeReadFile(filePath: string): Promise<SafeReadResult> {
       ok: false,
       code,
       reason: "Qodfy could not read this file."
+    };
+  }
+}
+
+async function safeStatFile(filePath: string): Promise<SafeStatResult> {
+  try {
+    const stats = await fs.stat(filePath);
+
+    return {
+      ok: true,
+      size: stats.size
+    };
+  } catch (error) {
+    const code = getErrorCode(error);
+
+    if (code === "ENOENT") {
+      return {
+        ok: false,
+        code,
+        reason: "The file disappeared while Qodfy was scanning it."
+      };
+    }
+
+    if (code === "EACCES" || code === "EPERM") {
+      return {
+        ok: false,
+        code,
+        reason: "Qodfy does not have permission to check this file."
+      };
+    }
+
+    return {
+      ok: false,
+      code,
+      reason: "Qodfy could not check this file."
     };
   }
 }
@@ -415,6 +559,7 @@ function getUsedEnvVariables(content: string) {
   const variables = new Set<string>();
   const dotAccessPattern = /\bprocess\.env\.([A-Za-z_][A-Za-z0-9_]*)/g;
   const bracketAccessPattern = /\bprocess\.env\[['"`]([A-Za-z_][A-Za-z0-9_]*)['"`]\]/g;
+  const destructuredEnvPattern = /\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*process\.env\b/g;
 
   for (const match of content.matchAll(dotAccessPattern)) {
     variables.add(match[1]);
@@ -424,7 +569,45 @@ function getUsedEnvVariables(content: string) {
     variables.add(match[1]);
   }
 
+  for (const match of content.matchAll(destructuredEnvPattern)) {
+    for (const variableName of parseDestructuredEnvNames(match[1])) {
+      variables.add(variableName);
+    }
+  }
+
   return variables;
+}
+
+function parseDestructuredEnvNames(destructuredContent: string) {
+  const variables: string[] = [];
+
+  for (const part of destructuredContent.split(",")) {
+    const variableName = part
+      .trim()
+      .split(":")[0]
+      .split("=")[0]
+      .trim();
+
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(variableName)) {
+      variables.push(variableName);
+    }
+  }
+
+  return variables;
+}
+
+function getHardcodedSecretMatches(content: string) {
+  const matches: Array<{ label: string }> = [];
+
+  for (const secretPattern of hardcodedSecretPatterns) {
+    secretPattern.pattern.lastIndex = 0;
+
+    if (secretPattern.pattern.test(content)) {
+      matches.push({ label: secretPattern.label });
+    }
+  }
+
+  return matches;
 }
 
 function isClientSideFile(relativeFile: string, content: string) {
@@ -433,6 +616,35 @@ function isClientSideFile(relativeFile: string, content: string) {
   return (
     fileName.includes(".client.") ||
     /(^|\n)\s*["']use client["'];?/.test(content)
+  );
+}
+
+function isApiRoute(filePath: string) {
+  return (
+    filePath.includes(`${path.sep}app${path.sep}api${path.sep}`) ||
+    filePath.includes(`${path.sep}pages${path.sep}api${path.sep}`)
+  );
+}
+
+function isStripeWebhookRoute(relativeFile: string, content: string) {
+  const normalizedFile = relativeFile.toLowerCase();
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    normalizedContent.includes("stripe") &&
+    (
+      normalizedFile.includes("webhook") ||
+      normalizedContent.includes("webhook") ||
+      normalizedContent.includes("stripe.webhooks")
+    )
+  );
+}
+
+function hasStripeWebhookSignatureVerification(content: string) {
+  return (
+    content.includes("stripe.webhooks.constructEvent") ||
+    content.includes("webhooks.constructEvent") ||
+    content.includes("constructEvent(")
   );
 }
 
