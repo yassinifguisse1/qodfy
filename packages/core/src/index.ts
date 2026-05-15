@@ -13,6 +13,27 @@ export type IssueCategory =
   | "maintainability"
   | "project";
 
+export const validScanChecks = [
+  "project",
+  "api",
+  "environment",
+  "ai",
+  "webhook",
+  "maintainability",
+  "security"
+] as const;
+
+export type ScanCheck = typeof validScanChecks[number];
+
+export const recommendedScanChecks: ScanCheck[] = [
+  "project",
+  "api",
+  "environment",
+  "ai",
+  "webhook",
+  "maintainability"
+];
+
 export type Issue = {
   id: string;
   ruleId: string;
@@ -37,6 +58,11 @@ export type ScanReport = {
     largeFiles: number;
     durationMs: number;
   };
+};
+
+export type ScanOptions = {
+  projectPath: string;
+  checks?: ScanCheck[];
 };
 
 type SafeReadResult =
@@ -177,18 +203,36 @@ const issueIdPrefixes: Record<string, string> = {
   "webhook-missing-signature-verification": "webhook-signature-verification"
 };
 
-export async function scanProject(projectPath: string): Promise<ScanReport> {
+export async function scanProject(input: string | ScanOptions): Promise<ScanReport> {
   const startTime = Date.now();
+  const projectPath = typeof input === "string" ? input : input.projectPath;
+  const enabledChecks = getEnabledChecks(
+    typeof input === "string" ? undefined : input.checks
+  );
   const resolvedProjectPath = path.resolve(projectPath);
   const issues: Issue[] = [];
   const addIssue = createIssueFactory(issues);
+  const runProjectChecks = hasCheck(enabledChecks, "project");
+  const runEnvironmentChecks = hasCheck(enabledChecks, "environment");
+  const runApiChecks = hasCheck(enabledChecks, "api") || hasCheck(enabledChecks, "security");
+  const runAiChecks = hasCheck(enabledChecks, "ai");
+  const runWebhookChecks = hasCheck(enabledChecks, "webhook") || hasCheck(enabledChecks, "security");
+  const runMaintainabilityChecks = hasCheck(enabledChecks, "maintainability");
+  const runSecurityChecks = hasCheck(enabledChecks, "security");
+  const shouldScanSourceFiles = enabledChecks.size > 0 && !onlyHasCheck(enabledChecks, "project");
+  const shouldReadSourceContent =
+    runEnvironmentChecks ||
+    runApiChecks ||
+    runAiChecks ||
+    runWebhookChecks ||
+    runSecurityChecks;
 
   const packageJsonPath = path.join(resolvedProjectPath, "package.json");
   const hasPackageJson = await fileExists(packageJsonPath);
 
   let isNextProject = false;
 
-  if (!hasPackageJson) {
+  if (runProjectChecks && !hasPackageJson) {
     addIssue({
       ruleId: "project-missing-package-json",
       category: "project",
@@ -198,7 +242,7 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       suggestion: "Run Qodfy from the project root or pass --path to the app folder.",
       fixPrompt: createProjectRootFixPrompt()
     });
-  } else {
+  } else if (runProjectChecks) {
     const packageJsonResult = await safeReadJson(packageJsonPath);
 
     if (!packageJsonResult.ok) {
@@ -246,10 +290,12 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
   }
 
   const envExamplePath = path.join(resolvedProjectPath, ".env.example");
-  const hasEnvExample = await fileExists(envExamplePath);
+  const hasEnvExample = runEnvironmentChecks
+    ? await fileExists(envExamplePath)
+    : false;
   let envExampleVariables: Set<string> | null = null;
 
-  if (!hasEnvExample) {
+  if (runEnvironmentChecks && !hasEnvExample) {
     addIssue({
       ruleId: "environment-missing-env-example",
       category: "environment",
@@ -259,7 +305,7 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       suggestion: "Document required variable names only, never real secret values.",
       fixPrompt: createMissingEnvExampleFixPrompt()
     });
-  } else {
+  } else if (runEnvironmentChecks) {
     const envExampleResult = await safeReadFile(envExamplePath);
 
     if (!envExampleResult.ok) {
@@ -278,9 +324,11 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     }
   }
 
-  const hasReadme = await fileExists(path.join(resolvedProjectPath, "README.md"));
+  const hasReadme = runProjectChecks
+    ? await fileExists(path.join(resolvedProjectPath, "README.md"))
+    : true;
 
-  if (!hasReadme) {
+  if (runProjectChecks && !hasReadme) {
     addIssue({
       ruleId: "project-missing-readme",
       category: "project",
@@ -291,7 +339,9 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     });
   }
 
-  const files = await getSourceFiles(resolvedProjectPath, addIssue);
+  const files = shouldScanSourceFiles
+    ? await getSourceFiles(resolvedProjectPath, addIssue)
+    : [];
 
   const apiRoutes = files.filter((file) => {
     return isApiRoute(file);
@@ -310,52 +360,39 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     const statResult = await safeStatFile(file);
 
     if (!statResult.ok) {
-      addIssue({
-        ruleId: "maintainability-file-unreadable",
-        category: "maintainability",
-        severity: "info",
-        title: "File could not be checked",
-        message: statResult.reason,
-        file: relativeFile,
-        suggestion: "Check file permissions if this file should be included in launch-readiness scans."
-      });
+      if (runMaintainabilityChecks) {
+        addIssue({
+          ruleId: "maintainability-file-unreadable",
+          category: "maintainability",
+          severity: "info",
+          title: "File could not be checked",
+          message: statResult.reason,
+          file: relativeFile,
+          suggestion: "Check file permissions if this file should be included in launch-readiness scans."
+        });
+      }
       continue;
     }
 
     if (statResult.size > MAX_FILE_SIZE_BYTES) {
-      largeFiles++;
+      if (runMaintainabilityChecks) {
+        largeFiles++;
 
-      addIssue({
-        ruleId: "maintainability-large-file-skipped",
-        category: "maintainability",
-        severity: "info",
-        title: "Large file skipped from deep scan",
-        message: "This file is larger than 500KB and was skipped from deep content checks.",
-        file: relativeFile,
-        suggestion: "Review large generated or bundled files manually.",
-        fixPrompt: createLargeFileFixPrompt(relativeFile)
-      });
+        addIssue({
+          ruleId: "maintainability-large-file-skipped",
+          category: "maintainability",
+          severity: "info",
+          title: "Large file skipped from deep scan",
+          message: "This file is larger than 500KB and was skipped from deep content checks.",
+          file: relativeFile,
+          suggestion: "Review large generated or bundled files manually.",
+          fixPrompt: createLargeFileFixPrompt(relativeFile)
+        });
+      }
       continue;
     }
 
-    const fileResult = await safeReadFile(file);
-
-    if (!fileResult.ok) {
-      addIssue({
-        ruleId: "maintainability-file-unreadable",
-        category: "maintainability",
-        severity: "info",
-        title: "File could not be read",
-        message: fileResult.reason,
-        file: relativeFile,
-        suggestion: "Check file permissions if this file should be included in launch-readiness scans."
-      });
-      continue;
-    }
-
-    const content = fileResult.content;
-
-    if (statResult.size > LARGE_FILE_WARNING_BYTES) {
+    if (runMaintainabilityChecks && statResult.size > LARGE_FILE_WARNING_BYTES) {
       largeFiles++;
       largeFileCandidates.push({
         relativeFile,
@@ -363,11 +400,34 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       });
     }
 
+    if (!shouldReadSourceContent) {
+      continue;
+    }
+
+    const fileResult = await safeReadFile(file);
+
+    if (!fileResult.ok) {
+      if (runMaintainabilityChecks) {
+        addIssue({
+          ruleId: "maintainability-file-unreadable",
+          category: "maintainability",
+          severity: "info",
+          title: "File could not be read",
+          message: fileResult.reason,
+          file: relativeFile,
+          suggestion: "Check file permissions if this file should be included in launch-readiness scans."
+        });
+      }
+      continue;
+    }
+
+    const content = fileResult.content;
+
     const usesAI = aiKeywords.some((keyword) =>
       content.toLowerCase().includes(keyword.toLowerCase())
     );
 
-    if (usesAI) {
+    if (runAiChecks && usesAI) {
       aiFiles++;
 
       const hasRateLimit =
@@ -390,7 +450,7 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       }
     }
 
-    const webhookRouteInfo = apiRouteSet.has(file)
+    const webhookRouteInfo = runWebhookChecks && apiRouteSet.has(file)
       ? getWebhookRouteInfo(relativeFile, content)
       : null;
 
@@ -410,28 +470,30 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       });
     }
 
-    for (const secretMatch of getHardcodedSecretMatches(content)) {
-      const warningKey = `${relativeFile}:${secretMatch.label}`;
+    if (runSecurityChecks) {
+      for (const secretMatch of getHardcodedSecretMatches(content)) {
+        const warningKey = `${relativeFile}:${secretMatch.label}`;
 
-      if (hardcodedSecretWarningKeys.has(warningKey)) {
-        continue;
+        if (hardcodedSecretWarningKeys.has(warningKey)) {
+          continue;
+        }
+
+        hardcodedSecretWarningKeys.add(warningKey);
+
+        addIssue({
+          ruleId: "security-hardcoded-secret",
+          category: "security",
+          severity: "critical",
+          title: "Possible hardcoded secret",
+          message: `A string literal in ${relativeFile} matches the pattern for ${secretMatch.label}. Qodfy does not print possible secret values.`,
+          file: relativeFile,
+          suggestion: "Move secrets into environment variables and rotate the value if this is a real secret.",
+          fixPrompt: createHardcodedSecretFixPrompt(relativeFile, secretMatch.label)
+        });
       }
-
-      hardcodedSecretWarningKeys.add(warningKey);
-
-      addIssue({
-        ruleId: "security-hardcoded-secret",
-        category: "security",
-        severity: "critical",
-        title: "Possible hardcoded secret",
-        message: `A string literal in ${relativeFile} matches the pattern for ${secretMatch.label}. Qodfy does not print possible secret values.`,
-        file: relativeFile,
-        suggestion: "Move secrets into environment variables and rotate the value if this is a real secret.",
-        fixPrompt: createHardcodedSecretFixPrompt(relativeFile, secretMatch.label)
-      });
     }
 
-    if (apiRouteSet.has(file)) {
+    if (runApiChecks && apiRouteSet.has(file)) {
       const hasAuth =
         content.includes("auth(") ||
         content.includes("getServerSession") ||
@@ -453,9 +515,11 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       }
     }
 
-    const usedEnvVariables = getUsedEnvVariables(content);
+    const usedEnvVariables = runEnvironmentChecks || runSecurityChecks
+      ? getUsedEnvVariables(content)
+      : new Set<string>();
 
-    if (envExampleVariables) {
+    if (runEnvironmentChecks && envExampleVariables) {
       for (const variableName of usedEnvVariables) {
         if (shouldIgnoreEnvVariable(variableName) || envExampleVariables.has(variableName)) {
           continue;
@@ -467,7 +531,7 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       }
     }
 
-    if (isClientSideFile(relativeFile, content)) {
+    if (runSecurityChecks && isClientSideFile(relativeFile, content)) {
       for (const variableName of usedEnvVariables) {
         if (!variableName.startsWith("NEXT_PUBLIC_") && !shouldIgnoreEnvVariable(variableName)) {
           const warningKey = `${relativeFile}:${variableName}`;
@@ -558,6 +622,22 @@ function createIssueFactory(issues: Issue[]): AddIssue {
 
 function getIssueIdPrefix(ruleId: string, category: IssueCategory) {
   return issueIdPrefixes[ruleId] ?? `${category}-${ruleId}`;
+}
+
+function getEnabledChecks(checks: ScanCheck[] | undefined) {
+  const checksToEnable = checks && checks.length > 0
+    ? checks
+    : recommendedScanChecks;
+
+  return new Set<ScanCheck>(checksToEnable);
+}
+
+function hasCheck(enabledChecks: Set<ScanCheck>, check: ScanCheck) {
+  return enabledChecks.has(check);
+}
+
+function onlyHasCheck(enabledChecks: Set<ScanCheck>, check: ScanCheck) {
+  return enabledChecks.size === 1 && enabledChecks.has(check);
 }
 
 async function fileExists(filePath: string) {
@@ -659,13 +739,17 @@ async function safeReadJson(filePath: string): Promise<SafeJsonResult> {
 
 async function getSourceFiles(projectPath: string, addIssue: AddIssue) {
   try {
-    return await fg(sourceFilePatterns, {
+    const files = await fg(sourceFilePatterns, {
       cwd: projectPath,
       ignore: ignoredPaths,
       absolute: true,
       onlyFiles: true,
       dot: false
     });
+
+    return files.sort((leftFile, rightFile) =>
+      normalizePath(leftFile).localeCompare(normalizePath(rightFile))
+    );
   } catch {
     addIssue({
       ruleId: "project-source-files-unreadable",
@@ -816,8 +900,7 @@ function getWebhookRouteInfo(relativeFile: string, content: string): WebhookRout
   const normalizedRouteContext = `${normalizedFile}\n${normalizedContent}`;
 
   const pathLooksLikeWebhook =
-    normalizedFile.includes("webhook") ||
-    normalizedFile.includes("callback");
+    /(^|[\/._-])(webhook|webhooks|callback)([\/._-]|$)/.test(normalizedFile);
   const contentStronglySuggestsWebhook =
     normalizedContent.includes("stripe.webhooks") ||
     normalizedContent.includes("constructevent(") ||
@@ -829,18 +912,14 @@ function getWebhookRouteInfo(relativeFile: string, content: string): WebhookRout
     normalizedContent.includes("x-hub-signature") ||
     normalizedContent.includes("x-shopify-hmac-sha256") ||
     (
-      normalizedContent.includes("resend") &&
-      normalizedContent.includes("webhook")
+      /\bresend\b/.test(normalizedContent) &&
+      /\bwebhook\b/.test(normalizedContent)
     ) ||
-    normalizedContent.includes("webhook_secret") ||
-    normalizedContent.includes("webhooksecret") ||
+    /\bwebhook_secret\b/.test(normalizedContent) ||
+    /\bwebhooksecret\b/.test(normalizedContent) ||
     (
-      normalizedContent.includes("webhook") &&
-      (
-        normalizedContent.includes("signature") ||
-        normalizedContent.includes("secret") ||
-        normalizedContent.includes("event")
-      )
+      /\bwebhook\b/.test(normalizedContent) &&
+      /\b(signature|secret|event|payload)\b/.test(normalizedContent)
     );
 
   if (!pathLooksLikeWebhook && !contentStronglySuggestsWebhook) {
@@ -862,16 +941,16 @@ function getWebhookProvider(normalizedRouteContext: string): WebhookProvider {
     normalizedRouteContext.includes("stripe.webhooks") ||
     normalizedRouteContext.includes("constructevent(") ||
     (
-      normalizedRouteContext.includes("stripe") &&
-      normalizedRouteContext.includes("webhook")
+      /\bstripe\b/.test(normalizedRouteContext) &&
+      /\bwebhook\b/.test(normalizedRouteContext)
     )
   ) {
     return "stripe";
   }
 
   if (
-    normalizedRouteContext.includes("resend") &&
-    normalizedRouteContext.includes("webhook")
+    /\bresend\b/.test(normalizedRouteContext) &&
+    /\bwebhook\b/.test(normalizedRouteContext)
   ) {
     return "resend";
   }
@@ -879,8 +958,8 @@ function getWebhookProvider(normalizedRouteContext: string): WebhookProvider {
   if (
     normalizedRouteContext.includes("clerk_webhook_secret") ||
     (
-      normalizedRouteContext.includes("clerk") &&
-      normalizedRouteContext.includes("webhook")
+      /\bclerk\b/.test(normalizedRouteContext) &&
+      /\bwebhook\b/.test(normalizedRouteContext)
     )
   ) {
     return "clerk";

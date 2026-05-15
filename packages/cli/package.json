@@ -1,6 +1,6 @@
 {
   "name": "qodfy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Open-source launch readiness scanner for AI-built apps.",
   "keywords": [
     "qodfy",
@@ -54,6 +54,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@inquirer/prompts": "^8.4.3",
     "@qodfy/core": "workspace:^",
     "commander": "^14.0.3",
     "picocolors": "^1.1.1"
