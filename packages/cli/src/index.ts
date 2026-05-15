@@ -33,6 +33,12 @@ type ScanCommandOptions = {
   interactive?: boolean;
 };
 
+type PromptCommandOptions = {
+  path: string;
+  checks?: string;
+  all?: boolean;
+};
+
 type ScanMode = "recommended" | "security-api" | "environment" | "ai" | "webhook" | "maintainability" | "custom";
 
 const DEFAULT_MAX_ISSUES = 20;
@@ -42,7 +48,7 @@ const program = new Command();
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.2.1");
+  .version("0.2.2");
 
 program
   .command("scan")
@@ -97,6 +103,53 @@ program
       }
       process.exitCode = 1;
     }
+  });
+
+program
+  .command("prompt <issue-id>")
+  .description("Print the safe AI fix prompt for a specific issue.")
+  .option("-p, --path <path>", "Project path to scan", process.cwd())
+  .option("--checks <checks>", "Comma-separated checks to search")
+  .option("--all", "Search all checks", true)
+  .action(async (issueId: string, options: PromptCommandOptions) => {
+    const pathResult = await resolveProjectPath(options.path);
+
+    if (!pathResult.ok) {
+      printScanError(pathResult.reason);
+      process.exitCode = 1;
+      return;
+    }
+
+    const checksResult = resolvePromptChecks(options);
+
+    if (!checksResult.ok) {
+      printPromptError(checksResult.reason);
+      process.exitCode = 1;
+      return;
+    }
+
+    const report = await scanProject({
+      projectPath: pathResult.projectPath,
+      checks: checksResult.checks
+    });
+
+    const issue = report.issues.find((scanIssue) => scanIssue.id === issueId);
+
+    if (!issue) {
+      printPromptError(
+        `Issue "${issueId}" was not found in this project scan.\nRun qodfy scan --all to see the current issue IDs.`
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    if (!issue.fixPrompt) {
+      printPromptError(`Issue "${issueId}" does not have an AI fix prompt yet.`);
+      process.exitCode = 1;
+      return;
+    }
+
+    printFixPrompt(issue);
   });
 
 const categoryOrder: IssueCategory[] = [
@@ -375,6 +428,28 @@ function isNonInteractiveTerminal() {
   return Boolean(process.env.CI) || !process.stdin.isTTY || !process.stdout.isTTY;
 }
 
+function resolvePromptChecks(options: PromptCommandOptions): ScanModeResult {
+  if (options.checks) {
+    const parsedChecks = parseChecks(options.checks);
+
+    if (!parsedChecks.ok) {
+      return parsedChecks;
+    }
+
+    return {
+      ok: true,
+      checks: parsedChecks.checks,
+      label: getScanModeLabel(parsedChecks.checks)
+    };
+  }
+
+  return {
+    ok: true,
+    checks: [...validScanChecks],
+    label: "All checks"
+  };
+}
+
 async function resolveProjectPath(projectPath: string): Promise<PathValidationResult> {
   const inputPath = projectPath.trim() || process.cwd();
   const resolvedPath = path.resolve(inputPath);
@@ -459,15 +534,21 @@ function printReport(
     console.log(`Use --max-issues <number> to show more.`);
   }
 
-  printGroupedIssues(issuesToShow, showPrompts);
+  printGroupedIssues(issuesToShow, showPrompts, report.projectPath);
 
   console.log("");
   console.log(pc.bold("Recommended next step:"));
   console.log("Fix critical issues first, then warnings, then cleanup items.");
   console.log("");
   console.log(pc.bold("Next commands:"));
+  const firstPromptIssue = issuesToShow.find((issue) => issue.fixPrompt);
+
+  if (firstPromptIssue) {
+    console.log(getPromptCommand(firstPromptIssue.id, report.projectPath));
+  }
+
   console.log("qodfy scan --checks api,environment");
-  console.log("qodfy scan --prompts --max-issues 5");
+  console.log("qodfy scan --max-issues 50");
 }
 
 function printSummary(issues: Issue[]) {
@@ -509,7 +590,7 @@ function printSummary(issues: Issue[]) {
   console.log("");
 }
 
-function printGroupedIssues(issues: Issue[], showPrompts: boolean) {
+function printGroupedIssues(issues: Issue[], showPrompts: boolean, projectPath: string) {
   for (const category of categoryOrder) {
     const categoryIssues = issues.filter((issue) => issue.category === category);
 
@@ -521,12 +602,12 @@ function printGroupedIssues(issues: Issue[], showPrompts: boolean) {
     console.log(pc.bold(categoryLabels[category]));
 
     for (const issue of categoryIssues) {
-      printIssue(issue, showPrompts);
+      printIssue(issue, showPrompts, projectPath);
     }
   }
 }
 
-function printIssue(issue: Issue, showPrompts: boolean) {
+function printIssue(issue: Issue, showPrompts: boolean, projectPath: string) {
   console.log("");
   console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)}`);
   console.log(issue.message);
@@ -543,7 +624,22 @@ function printIssue(issue: Issue, showPrompts: boolean) {
     console.log("");
     console.log(pc.bold("Fix Prompt:"));
     console.log(issue.fixPrompt);
+  } else if (issue.fixPrompt) {
+    console.log(pc.dim(`AI fix prompt: ${getPromptCommand(issue.id, projectPath)}`));
   }
+}
+
+function printFixPrompt(issue: Issue) {
+  console.log(pc.bold("Qodfy Fix Prompt"));
+  console.log("");
+  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)}`);
+
+  if (issue.file) {
+    console.log(pc.dim(`File: ${issue.file}`));
+  }
+
+  console.log("");
+  console.log(issue.fixPrompt);
 }
 
 function getSeverityLabel(severity: IssueSeverity) {
@@ -646,6 +742,34 @@ function getTopPriorities(issues: Issue[]) {
     .map((priority) => priority.message);
 }
 
+function getPromptCommand(issueId: string, projectPath: string) {
+  const relativeProjectPath = path.relative(process.cwd(), projectPath);
+  const promptPath = getPromptPath(projectPath, relativeProjectPath);
+  const pathOption = promptPath ? ` --path ${shellQuote(promptPath)}` : "";
+
+  return `qodfy prompt ${issueId}${pathOption}`;
+}
+
+function getPromptPath(projectPath: string, relativeProjectPath: string) {
+  if (!relativeProjectPath) {
+    return "";
+  }
+
+  if (!relativeProjectPath.startsWith("..") && !path.isAbsolute(relativeProjectPath)) {
+    return relativeProjectPath;
+  }
+
+  return projectPath;
+}
+
+function shellQuote(value: string) {
+  if (/^[A-Za-z0-9_./:-]+$/.test(value)) {
+    return value;
+  }
+
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 function printScanError(reason: string) {
   console.error(pc.red("Qodfy could not scan this project."));
   console.error("");
@@ -654,6 +778,16 @@ function printScanError(reason: string) {
   console.error("");
   console.error(pc.bold("Try:"));
   console.error("qodfy scan --path ./my-next-app");
+}
+
+function printPromptError(reason: string) {
+  console.error(pc.red("Qodfy could not create this fix prompt."));
+  console.error("");
+  console.error(pc.bold("Reason:"));
+  console.error(reason);
+  console.error("");
+  console.error(pc.bold("Try:"));
+  console.error("qodfy scan --all");
 }
 
 function getErrorMessage(error: unknown) {
