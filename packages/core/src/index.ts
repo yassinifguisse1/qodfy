@@ -3,6 +3,7 @@ import path from "node:path";
 import fg from "fast-glob";
 
 export type IssueSeverity = "critical" | "warning" | "info";
+export type IssueConfidence = "high" | "medium" | "low";
 
 export type IssueCategory =
   | "security"
@@ -39,6 +40,7 @@ export type Issue = {
   ruleId: string;
   category: IssueCategory;
   severity: IssueSeverity;
+  confidence: IssueConfidence;
   title: string;
   message: string;
   file?: string;
@@ -63,6 +65,7 @@ export type ScanReport = {
 export type ScanOptions = {
   projectPath: string;
   checks?: ScanCheck[];
+  includeLowConfidence?: boolean;
 };
 
 type SafeReadResult =
@@ -90,7 +93,17 @@ type WebhookRouteInfo = {
   confidence: "high" | "likely";
 };
 
-type IssueInput = Omit<Issue, "id">;
+type ApiRouteIntent =
+  | "public-read"
+  | "public-form"
+  | "webhook"
+  | "internal"
+  | "sensitive-mutation"
+  | "unknown";
+
+type IssueInput = Omit<Issue, "id" | "confidence"> & {
+  confidence?: IssueConfidence;
+};
 type AddIssue = (issue: IssueInput) => void;
 
 const sourceFilePatterns = ["**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"];
@@ -195,6 +208,9 @@ const issueIdPrefixes: Record<string, string> = {
   "security-client-side-secret": "security-client-side-secret",
   "security-hardcoded-secret": "security-hardcoded-secret",
   "api-route-missing-auth": "security-api-auth",
+  "api-public-read-route": "api-public-read-route",
+  "api-public-form-abuse-protection": "api-public-form-protection",
+  "api-internal-route-protection": "api-internal-route-protection",
   "ai-route-missing-rate-limit": "ai-route-rate-limit",
   "maintainability-large-file": "maintainability-large-file",
   "maintainability-large-file-skipped": "maintainability-large-file-skipped",
@@ -206,6 +222,9 @@ const issueIdPrefixes: Record<string, string> = {
 export async function scanProject(input: string | ScanOptions): Promise<ScanReport> {
   const startTime = Date.now();
   const projectPath = typeof input === "string" ? input : input.projectPath;
+  const includeLowConfidence = typeof input === "string"
+    ? false
+    : Boolean(input.includeLowConfidence);
   const enabledChecks = getEnabledChecks(
     typeof input === "string" ? undefined : input.checks
   );
@@ -237,6 +256,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       ruleId: "project-missing-package-json",
       category: "project",
       severity: "critical",
+      confidence: "high",
       title: "Missing package.json",
       message: "Qodfy could not find a package.json file in this project.",
       suggestion: "Run Qodfy from the project root or pass --path to the app folder.",
@@ -250,6 +270,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
         ruleId: "project-invalid-package-json",
         category: "project",
         severity: "critical",
+        confidence: "high",
         title: "Could not read package.json",
         message: packageJsonResult.reason,
         file: "package.json",
@@ -261,6 +282,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
         ruleId: "project-invalid-package-json",
         category: "project",
         severity: "critical",
+        confidence: "high",
         title: "Invalid package.json",
         message: "package.json must contain a JSON object at the top level.",
         file: "package.json",
@@ -280,6 +302,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
           ruleId: "project-next-not-detected",
           category: "project",
           severity: "warning",
+          confidence: "low",
           title: "Next.js not detected",
           message: "This first version of Qodfy is optimized for Next.js projects.",
           suggestion: "If this is a monorepo, scan the Next.js app folder directly.",
@@ -300,6 +323,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       ruleId: "environment-missing-env-example",
       category: "environment",
       severity: "warning",
+      confidence: "medium",
       title: "Missing .env.example",
       message: "Add a .env.example file so future developers know which environment variables are required.",
       suggestion: "Document required variable names only, never real secret values.",
@@ -313,6 +337,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
         ruleId: "environment-missing-env-example",
         category: "environment",
         severity: "warning",
+        confidence: "medium",
         title: "Could not read .env.example",
         message: envExampleResult.reason,
         file: ".env.example",
@@ -333,6 +358,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       ruleId: "project-missing-readme",
       category: "project",
       severity: "info",
+      confidence: "low",
       title: "Missing README.md",
       message: "A README helps other developers understand how to run and maintain the project.",
       fixPrompt: createReadmeFixPrompt()
@@ -365,6 +391,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
           ruleId: "maintainability-file-unreadable",
           category: "maintainability",
           severity: "info",
+          confidence: "low",
           title: "File could not be checked",
           message: statResult.reason,
           file: relativeFile,
@@ -382,6 +409,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
           ruleId: "maintainability-large-file-skipped",
           category: "maintainability",
           severity: "info",
+          confidence: "low",
           title: "Large file skipped from deep scan",
           message: "This file is larger than 500KB and was skipped from deep content checks.",
           file: relativeFile,
@@ -412,6 +440,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
           ruleId: "maintainability-file-unreadable",
           category: "maintainability",
           severity: "info",
+          confidence: "low",
           title: "File could not be read",
           message: fileResult.reason,
           file: relativeFile,
@@ -441,6 +470,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
           ruleId: "ai-route-missing-rate-limit",
           category: "ai",
           severity: "critical",
+          confidence: "high",
           title: "AI route may be missing rate limiting",
           message: "AI routes can create real API costs. Add rate limiting or usage limits before launch.",
           file: relativeFile,
@@ -450,7 +480,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       }
     }
 
-    const webhookRouteInfo = runWebhookChecks && apiRouteSet.has(file)
+    const webhookRouteInfo = (runWebhookChecks || runApiChecks) && apiRouteSet.has(file)
       ? getWebhookRouteInfo(relativeFile, content)
       : null;
 
@@ -462,6 +492,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
         ruleId: "webhook-missing-signature-verification",
         category: "webhook",
         severity: webhookRouteInfo.confidence === "high" ? "critical" : "warning",
+        confidence: webhookRouteInfo.confidence === "high" ? "high" : "medium",
         title: "Webhook route may be missing signature verification",
         message: "This webhook route appears to handle external events, but Qodfy could not find signature verification before the event is handled.",
         file: relativeFile,
@@ -484,6 +515,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
           ruleId: "security-hardcoded-secret",
           category: "security",
           severity: "critical",
+          confidence: "high",
           title: "Possible hardcoded secret",
           message: `A string literal in ${relativeFile} matches the pattern for ${secretMatch.label}. Qodfy does not print possible secret values.`,
           file: relativeFile,
@@ -494,25 +526,13 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
     }
 
     if (runApiChecks && apiRouteSet.has(file)) {
-      const hasAuth =
-        content.includes("auth(") ||
-        content.includes("getServerSession") ||
-        content.includes("currentUser") ||
-        content.includes("clerkClient") ||
-        content.includes("session");
-
-      if (!hasAuth && !webhookRouteInfo) {
-        addIssue({
-          ruleId: "api-route-missing-auth",
-          category: "api",
-          severity: "warning",
-          title: "API route may be missing authentication",
-          message: "This API route does not appear to contain an auth/session check.",
-          file: relativeFile,
-          suggestion: "Confirm the route is public, or add an auth/session check before handling user data.",
-          fixPrompt: createApiAuthFixPrompt(relativeFile)
-        });
-      }
+      addApiRouteProtectionIssues({
+        addIssue,
+        content,
+        includeLowConfidence,
+        relativeFile,
+        webhookRouteInfo
+      });
     }
 
     const usedEnvVariables = runEnvironmentChecks || runSecurityChecks
@@ -546,6 +566,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
             ruleId: "security-client-side-secret",
             category: "security",
             severity: "warning",
+            confidence: "medium",
             title: "Possible server secret used in client-side code",
             message: `${variableName} appears in a client-side file. Server secrets should not be exposed to the browser.`,
             file: relativeFile,
@@ -562,6 +583,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       ruleId: "maintainability-large-file",
       category: "maintainability",
       severity: "info",
+      confidence: "low",
       title: "Large file detected",
       message: "This file is larger than the recommended maintainability threshold. Large files can be harder to review, test, and safely modify.",
       file: largeFile.relativeFile,
@@ -577,6 +599,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       ruleId: "environment-variable-missing-from-example",
       category: "environment",
       severity: "warning",
+      confidence: "medium",
       title: "Environment variable missing from .env.example",
       message: getMissingEnvMessage(variableName, files),
       file: files.length === 1 ? files[0] : undefined,
@@ -614,8 +637,9 @@ function createIssueFactory(issues: Issue[]): AddIssue {
     issueCounts.set(issue.ruleId, currentCount);
 
     issues.push({
+      ...issue,
       id: `${getIssueIdPrefix(issue.ruleId, issue.category)}-${currentCount}`,
-      ...issue
+      confidence: issue.confidence ?? "medium"
     });
   };
 }
@@ -755,6 +779,7 @@ async function getSourceFiles(projectPath: string, addIssue: AddIssue) {
       ruleId: "project-source-files-unreadable",
       category: "project",
       severity: "critical",
+      confidence: "high",
       title: "Could not scan source files",
       message: "Qodfy could not list source files in this project.",
       suggestion: "Check that the project path exists and is readable.",
@@ -891,6 +916,274 @@ function isApiRoute(filePath: string) {
   return (
     new RegExp(`/app/api(?:/.+)?/route\\.${sourceFileExtension}$`).test(normalizedFile) ||
     new RegExp(`/pages/api/.+\\.${sourceFileExtension}$`).test(normalizedFile)
+  );
+}
+
+function addApiRouteProtectionIssues({
+  addIssue,
+  content,
+  includeLowConfidence,
+  relativeFile,
+  webhookRouteInfo
+}: {
+  addIssue: AddIssue;
+  content: string;
+  includeLowConfidence: boolean;
+  relativeFile: string;
+  webhookRouteInfo: WebhookRouteInfo | null;
+}) {
+  const intent = classifyApiRouteIntent(relativeFile, content, webhookRouteInfo);
+  const hasAuth = hasAuthOrSessionCheck(content);
+  const methods = getHttpMethods(content);
+
+  if (intent === "webhook") {
+    return;
+  }
+
+  if (intent === "public-read") {
+    if (includeLowConfidence) {
+      addIssue({
+        ruleId: "api-public-read-route",
+        category: "api",
+        severity: "info",
+        confidence: "low",
+        title: "Public read API route detected",
+        message: "This route appears intentionally public. Authentication may not be required.",
+        file: relativeFile,
+        suggestion: "Verify that it only exposes public or published data and has appropriate validation, caching, and abuse protection.",
+        fixPrompt: createPublicReadRouteFixPrompt(relativeFile)
+      });
+    }
+
+    return;
+  }
+
+  if (intent === "public-form") {
+    if (!hasAbuseProtection(content)) {
+      addIssue({
+        ruleId: "api-public-form-abuse-protection",
+        category: "api",
+        severity: "warning",
+        confidence: "medium",
+        title: "Public form route may be missing abuse protection",
+        message: "This route appears to accept public submissions. Consider adding rate limiting, validation, or spam protection.",
+        file: relativeFile,
+        suggestion: "Check for rate limiting, validation, captcha, Turnstile, reCAPTCHA, hCaptcha, or another spam protection pattern.",
+        fixPrompt: createPublicFormProtectionFixPrompt(relativeFile)
+      });
+    }
+
+    return;
+  }
+
+  if (intent === "internal") {
+    if (!hasInternalRouteProtection(content)) {
+      addIssue({
+        ruleId: "api-internal-route-protection",
+        category: "api",
+        severity: "warning",
+        confidence: "high",
+        title: "Internal API route may be missing protection",
+        message: "This route appears internal or operational. Confirm it is protected by auth, a secret token, or server-only access.",
+        file: relativeFile,
+        suggestion: "Use the project's existing auth pattern or a secret token check for operational routes such as cron, cleanup, or revalidation.",
+        fixPrompt: createInternalRouteProtectionFixPrompt(relativeFile)
+      });
+    }
+
+    return;
+  }
+
+  if (intent === "sensitive-mutation") {
+    if (!hasAuth) {
+      addIssue({
+        ruleId: "api-route-missing-auth",
+        category: "api",
+        severity: "warning",
+        confidence: "high",
+        title: "Sensitive API route may be missing authentication",
+        message: "This route appears to handle user-specific or sensitive operations. Confirm it is protected before launch.",
+        file: relativeFile,
+        suggestion: "Review the existing project auth/session pattern and apply it if this route handles private data, uploads, payments, or account changes.",
+        fixPrompt: createApiAuthFixPrompt(relativeFile)
+      });
+    }
+
+    return;
+  }
+
+  if (hasMutationMethod(methods) && !hasAuth) {
+    addIssue({
+      ruleId: "api-route-missing-auth",
+      category: "api",
+      severity: "warning",
+      confidence: "medium",
+      title: "API mutation route should be reviewed for authentication",
+      message: "This route appears to handle a mutation, but Qodfy could not find an auth/session check.",
+      file: relativeFile,
+      suggestion: "Confirm the route is intentionally public, or add the existing project auth/session check before handling private data.",
+      fixPrompt: createApiAuthFixPrompt(relativeFile)
+    });
+  }
+}
+
+function classifyApiRouteIntent(
+  relativeFile: string,
+  content: string,
+  webhookRouteInfo: WebhookRouteInfo | null
+): ApiRouteIntent {
+  const normalizedFile = relativeFile.toLowerCase();
+  const methods = getHttpMethods(content);
+
+  if (webhookRouteInfo || routePathHasAny(normalizedFile, ["webhook", "webhooks", "callback"])) {
+    return "webhook";
+  }
+
+  if (routePathHasAny(normalizedFile, ["internal", "admin", "cron", "cleanup", "revalidate", "private"])) {
+    return "internal";
+  }
+
+  if (routePathHasAny(normalizedFile, ["contact", "subscribe", "newsletter", "lead", "inquiry"])) {
+    return "public-form";
+  }
+
+  if (routePathHasAny(normalizedFile, [
+    "upload",
+    "checkout",
+    "order",
+    "orders",
+    "invoice",
+    "invoices",
+    "account",
+    "user",
+    "users",
+    "payment",
+    "billing",
+    "cart",
+    "profile",
+    "settings"
+  ])) {
+    return "sensitive-mutation";
+  }
+
+  if (routePathHasAny(normalizedFile, [
+    "blog",
+    "blogs",
+    "post",
+    "posts",
+    "product",
+    "products",
+    "search",
+    "i18n",
+    "category",
+    "categories",
+    "sitemap",
+    "rss"
+  ])) {
+    return "public-read";
+  }
+
+  if (hasMutationMethod(methods)) {
+    return "unknown";
+  }
+
+  if (methods.size === 0 || isReadOnlyRoute(methods)) {
+    return "unknown";
+  }
+
+  return "unknown";
+}
+
+function routePathHasAny(normalizedFile: string, terms: string[]) {
+  return terms.some((term) => {
+    const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    return new RegExp(`(^|[\\/._\\[\\]-])${escapedTerm}([\\/._\\[\\]-]|$)`).test(normalizedFile);
+  });
+}
+
+function getHttpMethods(content: string) {
+  const methods = new Set<string>();
+  const exportedMethodPattern = /\bexport\s+(?:async\s+)?(?:function|const)\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/g;
+  const requestMethodPattern = /\b(?:request|req)\.method\s*(?:={2,3}|!={1,2})\s*["'](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)["']/g;
+  const methodCasePattern = /\bcase\s+["'](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)["']/g;
+
+  for (const match of content.matchAll(exportedMethodPattern)) {
+    methods.add(match[1]);
+  }
+
+  for (const match of content.matchAll(requestMethodPattern)) {
+    methods.add(match[1]);
+  }
+
+  for (const match of content.matchAll(methodCasePattern)) {
+    methods.add(match[1]);
+  }
+
+  return methods;
+}
+
+function hasMutationMethod(methods: Set<string>) {
+  return ["POST", "PUT", "PATCH", "DELETE"].some((method) => methods.has(method));
+}
+
+function isReadOnlyRoute(methods: Set<string>) {
+  return [...methods].every((method) => method === "GET" || method === "HEAD" || method === "OPTIONS");
+}
+
+function hasAuthOrSessionCheck(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    normalizedContent.includes("auth(") ||
+    normalizedContent.includes("getserversession") ||
+    normalizedContent.includes("currentuser") ||
+    normalizedContent.includes("clerkclient") ||
+    normalizedContent.includes("session") ||
+    normalizedContent.includes("requireauth") ||
+    normalizedContent.includes("requireuser") ||
+    normalizedContent.includes("requireadmin") ||
+    normalizedContent.includes("verifysession") ||
+    normalizedContent.includes("getuser") ||
+    normalizedContent.includes("jwt") ||
+    normalizedContent.includes("authorization") ||
+    normalizedContent.includes("bearer") ||
+    normalizedContent.includes("cookies()") ||
+    normalizedContent.includes("request.cookies") ||
+    normalizedContent.includes("middleware")
+  );
+}
+
+function hasInternalRouteProtection(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    hasAuthOrSessionCheck(content) ||
+    /\bprocess\.env\.[A-Za-z0-9_]*SECRET\b/.test(content) ||
+    /\bprocess\.env\[['"`][A-Za-z0-9_]*SECRET['"`]\]/.test(content) ||
+    normalizedContent.includes("cron_secret") ||
+    normalizedContent.includes("revalidate_secret") ||
+    normalizedContent.includes("authorization") ||
+    normalizedContent.includes("bearer") ||
+    normalizedContent.includes("token")
+  );
+}
+
+function hasAbuseProtection(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    normalizedContent.includes("ratelimit") ||
+    normalizedContent.includes("rate limit") ||
+    normalizedContent.includes("limiter") ||
+    normalizedContent.includes("captcha") ||
+    normalizedContent.includes("turnstile") ||
+    normalizedContent.includes("recaptcha") ||
+    normalizedContent.includes("hcaptcha") ||
+    normalizedContent.includes("validation") ||
+    normalizedContent.includes("validate") ||
+    normalizedContent.includes("zod") ||
+    normalizedContent.includes("safeparse")
   );
 }
 
@@ -1102,6 +1395,65 @@ Instructions:
 Return:
 - A short explanation of what you changed.
 - The updated code.
+- Any edge cases I should test.`;
+}
+
+function createPublicReadRouteFixPrompt(file: string) {
+  return `Review the public read API route at ${file}.
+
+Goal:
+Verify that this route is safe to remain public.
+
+Instructions:
+- Confirm it only exposes published, public, or non-sensitive data.
+- Check that route params and query values are validated or sanitized.
+- Check for appropriate cache headers where useful.
+- Check for abuse protection if the route can be called heavily.
+- Do not add user authentication unless the route should be private.
+- Do not refactor unrelated code.
+
+Return:
+- Whether this route appears intentionally public.
+- Any low-risk safety improvements.
+- Any edge cases I should test.`;
+}
+
+function createPublicFormProtectionFixPrompt(file: string) {
+  return `Review the public form API route at ${file}.
+
+Goal:
+Verify validation, rate limiting, and spam protection.
+
+Instructions:
+- Confirm submitted input is validated before it is used.
+- Check for rate limiting or another abuse protection pattern.
+- Check whether captcha, Turnstile, reCAPTCHA, or hCaptcha is appropriate.
+- Do not add user authentication unless the form should be private.
+- Do not introduce a new service unless necessary.
+- Keep existing behavior unchanged.
+
+Return:
+- Whether abuse protection already exists.
+- The safest minimal change if protection is missing.
+- Any edge cases I should test.`;
+}
+
+function createInternalRouteProtectionFixPrompt(file: string) {
+  return `Review the internal API route at ${file}.
+
+Goal:
+Confirm this operational route is protected before launch.
+
+Instructions:
+- Check whether the route is protected by existing auth, a secret token, or server-only access.
+- For cron, cleanup, revalidation, or admin routes, prefer the existing project protection pattern.
+- Do not introduce a new auth provider.
+- Do not change route behavior unless protection is missing.
+- If the route is intentionally reachable, add a short comment explaining the protection boundary.
+
+Return:
+- Whether protection already exists.
+- The safest minimal change if protection is missing.
 - Any edge cases I should test.`;
 }
 

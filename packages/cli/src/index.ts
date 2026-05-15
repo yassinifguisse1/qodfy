@@ -11,6 +11,7 @@ import {
   validScanChecks,
   type Issue,
   type IssueCategory,
+  type IssueConfidence,
   type IssueSeverity,
   type ScanCheck,
   type ScanReport
@@ -21,13 +22,14 @@ type PathValidationResult =
   | { ok: false; reason: string };
 
 type ScanModeResult =
-  | { ok: true; checks: ScanCheck[]; label: string; notice?: string }
+  | { ok: true; checks: ScanCheck[]; label: string; notice?: string; includeLowConfidence?: boolean }
   | { ok: false; reason: string };
 
 type ScanCommandOptions = {
   path: string;
   maxIssues: string;
   prompts?: boolean;
+  prompt?: string;
   checks?: string;
   all?: boolean;
   interactive?: boolean;
@@ -41,14 +43,14 @@ type PromptCommandOptions = {
 
 type ScanMode = "recommended" | "security-api" | "environment" | "ai" | "webhook" | "maintainability" | "custom";
 
-const DEFAULT_MAX_ISSUES = 20;
+const DEFAULT_MAX_ISSUES = 5;
 
 const program = new Command();
 
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.2.2");
+  .version("0.2.3");
 
 program
   .command("scan")
@@ -56,6 +58,7 @@ program
   .option("-p, --path <path>", "Project path to scan", process.cwd())
   .option("--max-issues <number>", "Maximum number of issues to display", String(DEFAULT_MAX_ISSUES))
   .option("--prompts", "Show safe copy-paste fix prompts for displayed issues")
+  .option("--prompt <issue-id>", "Show the safe AI fix prompt for one issue")
   .option("--checks <checks>", "Comma-separated checks to run")
   .option("--all", "Run all checks without prompting")
   .option("--no-interactive", "Skip interactive prompts and run the recommended scan")
@@ -86,14 +89,22 @@ program
 
       const report = await scanProject({
         projectPath: pathResult.projectPath,
-        checks: scanModeResult.checks
+        checks: scanModeResult.checks,
+        includeLowConfidence: Boolean(scanModeResult.includeLowConfidence)
       });
+
+      if (options.prompt) {
+        printPromptFromReport(report, options.prompt);
+        return;
+      }
 
       printReport(
         report,
         parseMaxIssues(options.maxIssues),
         Boolean(options.prompts),
-        scanModeResult.label
+        scanModeResult.label,
+        Boolean(options.all),
+        Boolean(options.all)
       );
     } catch (error) {
       if (isPromptCancelError(error)) {
@@ -130,7 +141,8 @@ program
 
     const report = await scanProject({
       projectPath: pathResult.projectPath,
-      checks: checksResult.checks
+      checks: checksResult.checks,
+      includeLowConfidence: true
     });
 
     const issue = report.issues.find((scanIssue) => scanIssue.id === issueId);
@@ -193,7 +205,17 @@ async function resolveScanMode(options: ScanCommandOptions): Promise<ScanModeRes
     return {
       ok: true,
       checks: [...validScanChecks],
-      label: "All checks"
+      label: "All checks",
+      includeLowConfidence: true
+    };
+  }
+
+  if (options.prompt) {
+    return {
+      ok: true,
+      checks: [...validScanChecks],
+      label: "All checks",
+      includeLowConfidence: true
     };
   }
 
@@ -496,7 +518,9 @@ function printReport(
   report: ScanReport,
   maxIssues: number,
   showPrompts: boolean,
-  scanModeLabel: string
+  scanModeLabel: string,
+  showDetails: boolean,
+  showAllIssues: boolean
 ) {
   console.log(pc.bold("Qodfy Report"));
   console.log("");
@@ -525,16 +549,17 @@ function printReport(
     return;
   }
 
-  console.log(pc.bold("Issues"));
+  console.log(pc.bold(showAllIssues ? "Issues" : "Top issues"));
   const displayIssues = getSortedDisplayIssues(report.issues);
-  const issuesToShow = displayIssues.slice(0, maxIssues);
+  const issueLimit = showAllIssues ? displayIssues.length : maxIssues;
+  const issuesToShow = displayIssues.slice(0, issueLimit);
 
-  if (report.issues.length > maxIssues) {
-    console.log(`Showing ${maxIssues} of ${report.issues.length} issues.`);
-    console.log(`Use --max-issues <number> to show more.`);
+  if (report.issues.length > issueLimit) {
+    console.log(`Showing ${issueLimit} of ${report.issues.length} issues.`);
+    console.log(`Use --max-issues <number> to show more, or --all for full details.`);
   }
 
-  printGroupedIssues(issuesToShow, showPrompts, report.projectPath);
+  printGroupedIssues(issuesToShow, showPrompts, showDetails, report.projectPath);
 
   console.log("");
   console.log(pc.bold("Recommended next step:"));
@@ -548,7 +573,7 @@ function printReport(
   }
 
   console.log("qodfy scan --checks api,environment");
-  console.log("qodfy scan --max-issues 50");
+  console.log("qodfy scan --all");
 }
 
 function printSummary(issues: Issue[]) {
@@ -590,7 +615,12 @@ function printSummary(issues: Issue[]) {
   console.log("");
 }
 
-function printGroupedIssues(issues: Issue[], showPrompts: boolean, projectPath: string) {
+function printGroupedIssues(
+  issues: Issue[],
+  showPrompts: boolean,
+  showDetails: boolean,
+  projectPath: string
+) {
   for (const category of categoryOrder) {
     const categoryIssues = issues.filter((issue) => issue.category === category);
 
@@ -602,21 +632,29 @@ function printGroupedIssues(issues: Issue[], showPrompts: boolean, projectPath: 
     console.log(pc.bold(categoryLabels[category]));
 
     for (const issue of categoryIssues) {
-      printIssue(issue, showPrompts, projectPath);
+      printIssue(issue, showPrompts, showDetails, projectPath);
     }
   }
 }
 
-function printIssue(issue: Issue, showPrompts: boolean, projectPath: string) {
+function printIssue(
+  issue: Issue,
+  showPrompts: boolean,
+  showDetails: boolean,
+  projectPath: string
+) {
   console.log("");
-  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)}`);
-  console.log(issue.message);
+  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)} ${pc.dim(`(${issue.confidence} confidence)`)}`);
 
   if (issue.file) {
     console.log(pc.dim(`File: ${issue.file}`));
   }
 
-  if (issue.suggestion) {
+  if (showDetails || showPrompts) {
+    console.log(issue.message);
+  }
+
+  if ((showDetails || showPrompts) && issue.suggestion) {
     console.log(pc.dim(`Suggestion: ${issue.suggestion}`));
   }
 
@@ -625,14 +663,14 @@ function printIssue(issue: Issue, showPrompts: boolean, projectPath: string) {
     console.log(pc.bold("Fix Prompt:"));
     console.log(issue.fixPrompt);
   } else if (issue.fixPrompt) {
-    console.log(pc.dim(`AI fix prompt: ${getPromptCommand(issue.id, projectPath)}`));
+    console.log(pc.dim(`Fix: ${getPromptCommand(issue.id, projectPath)}`));
   }
 }
 
 function printFixPrompt(issue: Issue) {
   console.log(pc.bold("Qodfy Fix Prompt"));
   console.log("");
-  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)}`);
+  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)} ${pc.dim(`(${issue.confidence} confidence)`)}`);
 
   if (issue.file) {
     console.log(pc.dim(`File: ${issue.file}`));
@@ -640,6 +678,26 @@ function printFixPrompt(issue: Issue) {
 
   console.log("");
   console.log(issue.fixPrompt);
+}
+
+function printPromptFromReport(report: ScanReport, issueId: string) {
+  const issue = report.issues.find((scanIssue) => scanIssue.id === issueId);
+
+  if (!issue) {
+    printPromptError(
+      `Issue "${issueId}" was not found in this project scan.\nRun qodfy scan --all to see the current issue IDs.`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!issue.fixPrompt) {
+    printPromptError(`Issue "${issueId}" does not have an AI fix prompt yet.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  printFixPrompt(issue);
 }
 
 function getSeverityLabel(severity: IssueSeverity) {
@@ -662,6 +720,7 @@ function getSortedDisplayIssues(issues: Issue[]) {
   return [...issues].sort((leftIssue, rightIssue) => {
     return (
       getSeverityRank(leftIssue.severity) - getSeverityRank(rightIssue.severity) ||
+      getConfidenceRank(leftIssue.confidence) - getConfidenceRank(rightIssue.confidence) ||
       categoryOrder.indexOf(leftIssue.category) - categoryOrder.indexOf(rightIssue.category) ||
       leftIssue.ruleId.localeCompare(rightIssue.ruleId) ||
       getIssueNumber(leftIssue.id) - getIssueNumber(rightIssue.id) ||
@@ -682,6 +741,18 @@ function getSeverityRank(severity: IssueSeverity) {
   }
 
   if (severity === "warning") {
+    return 1;
+  }
+
+  return 2;
+}
+
+function getConfidenceRank(confidence: IssueConfidence) {
+  if (confidence === "high") {
+    return 0;
+  }
+
+  if (confidence === "medium") {
     return 1;
   }
 
