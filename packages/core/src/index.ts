@@ -4,12 +4,25 @@ import fg from "fast-glob";
 
 export type IssueSeverity = "critical" | "warning" | "info";
 
+export type IssueCategory =
+  | "security"
+  | "environment"
+  | "api"
+  | "webhook"
+  | "ai"
+  | "maintainability"
+  | "project";
+
 export type Issue = {
+  id: string;
+  ruleId: string;
+  category: IssueCategory;
   severity: IssueSeverity;
   title: string;
   message: string;
   file?: string;
   suggestion?: string;
+  fixPrompt?: string;
 };
 
 export type ScanReport = {
@@ -50,6 +63,9 @@ type WebhookRouteInfo = {
   provider: WebhookProvider;
   confidence: "high" | "likely";
 };
+
+type IssueInput = Omit<Issue, "id">;
+type AddIssue = (issue: IssueInput) => void;
 
 const sourceFilePatterns = ["**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"];
 
@@ -143,10 +159,29 @@ const LARGE_FILE_WARNING_BYTES = 40 * 1024;
 const LARGE_FILE_REPORT_LIMIT = 10;
 const MAX_FILE_SIZE_BYTES = 500 * 1024;
 
+const issueIdPrefixes: Record<string, string> = {
+  "project-missing-package-json": "project-missing-package-json",
+  "project-invalid-package-json": "project-invalid-package-json",
+  "project-next-not-detected": "project-next-not-detected",
+  "project-missing-readme": "project-missing-readme",
+  "environment-missing-env-example": "environment-missing-env-example",
+  "environment-variable-missing-from-example": "environment-variable-missing-from-example",
+  "security-client-side-secret": "security-client-side-secret",
+  "security-hardcoded-secret": "security-hardcoded-secret",
+  "api-route-missing-auth": "security-api-auth",
+  "ai-route-missing-rate-limit": "ai-route-rate-limit",
+  "maintainability-large-file": "maintainability-large-file",
+  "maintainability-large-file-skipped": "maintainability-large-file-skipped",
+  "maintainability-file-unreadable": "maintainability-file-unreadable",
+  "project-source-files-unreadable": "project-source-files-unreadable",
+  "webhook-missing-signature-verification": "webhook-signature-verification"
+};
+
 export async function scanProject(projectPath: string): Promise<ScanReport> {
   const startTime = Date.now();
   const resolvedProjectPath = path.resolve(projectPath);
   const issues: Issue[] = [];
+  const addIssue = createIssueFactory(issues);
 
   const packageJsonPath = path.join(resolvedProjectPath, "package.json");
   const hasPackageJson = await fileExists(packageJsonPath);
@@ -154,30 +189,39 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
   let isNextProject = false;
 
   if (!hasPackageJson) {
-    issues.push({
+    addIssue({
+      ruleId: "project-missing-package-json",
+      category: "project",
       severity: "critical",
       title: "Missing package.json",
       message: "Qodfy could not find a package.json file in this project.",
-      suggestion: "Run Qodfy from the project root or pass --path to the app folder."
+      suggestion: "Run Qodfy from the project root or pass --path to the app folder.",
+      fixPrompt: createProjectRootFixPrompt()
     });
   } else {
     const packageJsonResult = await safeReadJson(packageJsonPath);
 
     if (!packageJsonResult.ok) {
-      issues.push({
+      addIssue({
+        ruleId: "project-invalid-package-json",
+        category: "project",
         severity: "critical",
         title: "Could not read package.json",
         message: packageJsonResult.reason,
         file: "package.json",
-        suggestion: "Fix package.json so Qodfy can detect the framework and dependencies."
+        suggestion: "Fix package.json so Qodfy can detect the framework and dependencies.",
+        fixPrompt: createPackageJsonFixPrompt()
       });
     } else if (!isPackageJsonObject(packageJsonResult.data)) {
-      issues.push({
+      addIssue({
+        ruleId: "project-invalid-package-json",
+        category: "project",
         severity: "critical",
         title: "Invalid package.json",
         message: "package.json must contain a JSON object at the top level.",
         file: "package.json",
-        suggestion: "Fix package.json so Qodfy can detect the framework and dependencies."
+        suggestion: "Fix package.json so Qodfy can detect the framework and dependencies.",
+        fixPrompt: createPackageJsonFixPrompt()
       });
     } else {
       const deps = {
@@ -188,11 +232,14 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       isNextProject = Boolean(deps.next);
 
       if (!isNextProject) {
-        issues.push({
+        addIssue({
+          ruleId: "project-next-not-detected",
+          category: "project",
           severity: "warning",
           title: "Next.js not detected",
           message: "This first version of Qodfy is optimized for Next.js projects.",
-          suggestion: "If this is a monorepo, scan the Next.js app folder directly."
+          suggestion: "If this is a monorepo, scan the Next.js app folder directly.",
+          fixPrompt: createNextNotDetectedFixPrompt()
         });
       }
     }
@@ -203,22 +250,28 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
   let envExampleVariables: Set<string> | null = null;
 
   if (!hasEnvExample) {
-    issues.push({
+    addIssue({
+      ruleId: "environment-missing-env-example",
+      category: "environment",
       severity: "warning",
       title: "Missing .env.example",
       message: "Add a .env.example file so future developers know which environment variables are required.",
-      suggestion: "Document required variable names only, never real secret values."
+      suggestion: "Document required variable names only, never real secret values.",
+      fixPrompt: createMissingEnvExampleFixPrompt()
     });
   } else {
     const envExampleResult = await safeReadFile(envExamplePath);
 
     if (!envExampleResult.ok) {
-      issues.push({
+      addIssue({
+        ruleId: "environment-missing-env-example",
+        category: "environment",
         severity: "warning",
         title: "Could not read .env.example",
         message: envExampleResult.reason,
         file: ".env.example",
-        suggestion: "Make sure .env.example is readable and contains variable names without real secret values."
+        suggestion: "Make sure .env.example is readable and contains variable names without real secret values.",
+        fixPrompt: createMissingEnvExampleFixPrompt()
       });
     } else {
       envExampleVariables = getEnvExampleVariables(envExampleResult.content);
@@ -228,14 +281,17 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
   const hasReadme = await fileExists(path.join(resolvedProjectPath, "README.md"));
 
   if (!hasReadme) {
-    issues.push({
+    addIssue({
+      ruleId: "project-missing-readme",
+      category: "project",
       severity: "info",
       title: "Missing README.md",
-      message: "A README helps other developers understand how to run and maintain the project."
+      message: "A README helps other developers understand how to run and maintain the project.",
+      fixPrompt: createReadmeFixPrompt()
     });
   }
 
-  const files = await getSourceFiles(resolvedProjectPath, issues);
+  const files = await getSourceFiles(resolvedProjectPath, addIssue);
 
   const apiRoutes = files.filter((file) => {
     return isApiRoute(file);
@@ -254,11 +310,14 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     const statResult = await safeStatFile(file);
 
     if (!statResult.ok) {
-      issues.push({
+      addIssue({
+        ruleId: "maintainability-file-unreadable",
+        category: "maintainability",
         severity: "info",
         title: "File could not be checked",
         message: statResult.reason,
-        file: relativeFile
+        file: relativeFile,
+        suggestion: "Check file permissions if this file should be included in launch-readiness scans."
       });
       continue;
     }
@@ -266,12 +325,15 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     if (statResult.size > MAX_FILE_SIZE_BYTES) {
       largeFiles++;
 
-      issues.push({
+      addIssue({
+        ruleId: "maintainability-large-file-skipped",
+        category: "maintainability",
         severity: "info",
         title: "Large file skipped from deep scan",
         message: "This file is larger than 500KB and was skipped from deep content checks.",
         file: relativeFile,
-        suggestion: "Review large generated or bundled files manually."
+        suggestion: "Review large generated or bundled files manually.",
+        fixPrompt: createLargeFileFixPrompt(relativeFile)
       });
       continue;
     }
@@ -279,11 +341,14 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
     const fileResult = await safeReadFile(file);
 
     if (!fileResult.ok) {
-      issues.push({
+      addIssue({
+        ruleId: "maintainability-file-unreadable",
+        category: "maintainability",
         severity: "info",
         title: "File could not be read",
         message: fileResult.reason,
-        file: relativeFile
+        file: relativeFile,
+        suggestion: "Check file permissions if this file should be included in launch-readiness scans."
       });
       continue;
     }
@@ -312,12 +377,15 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
         content.includes("limiter");
 
       if (apiRouteSet.has(file) && !hasRateLimit) {
-        issues.push({
+        addIssue({
+          ruleId: "ai-route-missing-rate-limit",
+          category: "ai",
           severity: "critical",
           title: "AI route may be missing rate limiting",
           message: "AI routes can create real API costs. Add rate limiting or usage limits before launch.",
           file: relativeFile,
-          suggestion: "Add rate limiting, usage limits, or per-user quotas before launch."
+          suggestion: "Add rate limiting, usage limits, or per-user quotas before launch.",
+          fixPrompt: createAiRateLimitFixPrompt(relativeFile)
         });
       }
     }
@@ -330,12 +398,15 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       webhookRouteInfo &&
       !hasWebhookSignatureVerification(content, webhookRouteInfo.provider)
     ) {
-      issues.push({
+      addIssue({
+        ruleId: "webhook-missing-signature-verification",
+        category: "webhook",
         severity: webhookRouteInfo.confidence === "high" ? "critical" : "warning",
         title: "Webhook route may be missing signature verification",
         message: "This webhook route appears to handle external events, but Qodfy could not find signature verification before the event is handled.",
         file: relativeFile,
-        suggestion: getWebhookSignatureSuggestion(webhookRouteInfo.provider)
+        suggestion: getWebhookSignatureSuggestion(webhookRouteInfo.provider),
+        fixPrompt: createWebhookSignatureFixPrompt(relativeFile)
       });
     }
 
@@ -348,12 +419,15 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
 
       hardcodedSecretWarningKeys.add(warningKey);
 
-      issues.push({
+      addIssue({
+        ruleId: "security-hardcoded-secret",
+        category: "security",
         severity: "critical",
         title: "Possible hardcoded secret",
         message: `A string literal in ${relativeFile} matches the pattern for ${secretMatch.label}. Qodfy does not print possible secret values.`,
         file: relativeFile,
-        suggestion: "Move secrets into environment variables and rotate the value if this is a real secret."
+        suggestion: "Move secrets into environment variables and rotate the value if this is a real secret.",
+        fixPrompt: createHardcodedSecretFixPrompt(relativeFile, secretMatch.label)
       });
     }
 
@@ -366,12 +440,15 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
         content.includes("session");
 
       if (!hasAuth && !webhookRouteInfo) {
-        issues.push({
+        addIssue({
+          ruleId: "api-route-missing-auth",
+          category: "api",
           severity: "warning",
           title: "API route may be missing authentication",
           message: "This API route does not appear to contain an auth/session check.",
           file: relativeFile,
-          suggestion: "Confirm the route is public, or add an auth/session check before handling user data."
+          suggestion: "Confirm the route is public, or add an auth/session check before handling user data.",
+          fixPrompt: createApiAuthFixPrompt(relativeFile)
         });
       }
     }
@@ -401,12 +478,15 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
 
           clientSecretWarningKeys.add(warningKey);
 
-          issues.push({
+          addIssue({
+            ruleId: "security-client-side-secret",
+            category: "security",
             severity: "warning",
             title: "Possible server secret used in client-side code",
             message: `${variableName} appears in a client-side file. Server secrets should not be exposed to the browser.`,
             file: relativeFile,
-            suggestion: "Move server-only environment variable access to a server component, API route, or server action."
+            suggestion: "Move server-only environment variable access to a server component, API route, or server action.",
+            fixPrompt: createClientSideSecretFixPrompt(relativeFile, variableName)
           });
         }
       }
@@ -414,24 +494,30 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
   }
 
   for (const largeFile of getReportedLargeFiles(largeFileCandidates)) {
-    issues.push({
+    addIssue({
+      ruleId: "maintainability-large-file",
+      category: "maintainability",
       severity: "info",
       title: "Large file detected",
-      message: "Large files are harder to maintain and often appear in AI-generated codebases.",
+      message: "This file is larger than the recommended maintainability threshold. Large files can be harder to review, test, and safely modify.",
       file: largeFile.relativeFile,
-      suggestion: "Consider splitting this file into smaller modules if it mixes unrelated responsibilities."
+      suggestion: "Review whether this file mixes UI, state, data fetching, validation, or business logic. If so, split it into smaller components, hooks, or utilities.",
+      fixPrompt: createLargeFileFixPrompt(largeFile.relativeFile)
     });
   }
 
   for (const [variableName, filesUsingVariable] of getSortedMissingEnvUsages(missingEnvUsages)) {
     const files = [...filesUsingVariable].sort();
 
-    issues.push({
+    addIssue({
+      ruleId: "environment-variable-missing-from-example",
+      category: "environment",
       severity: "warning",
       title: "Environment variable missing from .env.example",
       message: getMissingEnvMessage(variableName, files),
       file: files.length === 1 ? files[0] : undefined,
-      suggestion: `Add ${variableName}= to .env.example without including a real value.`
+      suggestion: `Add ${variableName}= to .env.example without including a real value.`,
+      fixPrompt: createMissingEnvVariableFixPrompt(variableName, files)
     });
   }
 
@@ -454,6 +540,24 @@ export async function scanProject(projectPath: string): Promise<ScanReport> {
       durationMs: Date.now() - startTime
     }
   };
+}
+
+function createIssueFactory(issues: Issue[]): AddIssue {
+  const issueCounts = new Map<string, number>();
+
+  return (issue: IssueInput) => {
+    const currentCount = (issueCounts.get(issue.ruleId) ?? 0) + 1;
+    issueCounts.set(issue.ruleId, currentCount);
+
+    issues.push({
+      id: `${getIssueIdPrefix(issue.ruleId, issue.category)}-${currentCount}`,
+      ...issue
+    });
+  };
+}
+
+function getIssueIdPrefix(ruleId: string, category: IssueCategory) {
+  return issueIdPrefixes[ruleId] ?? `${category}-${ruleId}`;
 }
 
 async function fileExists(filePath: string) {
@@ -553,7 +657,7 @@ async function safeReadJson(filePath: string): Promise<SafeJsonResult> {
   }
 }
 
-async function getSourceFiles(projectPath: string, issues: Issue[]) {
+async function getSourceFiles(projectPath: string, addIssue: AddIssue) {
   try {
     return await fg(sourceFilePatterns, {
       cwd: projectPath,
@@ -563,11 +667,14 @@ async function getSourceFiles(projectPath: string, issues: Issue[]) {
       dot: false
     });
   } catch {
-    issues.push({
+    addIssue({
+      ruleId: "project-source-files-unreadable",
+      category: "project",
       severity: "critical",
       title: "Could not scan source files",
       message: "Qodfy could not list source files in this project.",
-      suggestion: "Check that the project path exists and is readable."
+      suggestion: "Check that the project path exists and is readable.",
+      fixPrompt: createProjectRootFixPrompt()
     });
 
     return [];
@@ -897,6 +1004,237 @@ function getWebhookSignatureSuggestion(provider: WebhookProvider) {
   }
 
   return "Verify the provider signature using the raw request body and signature header before trusting the event.";
+}
+
+function createApiAuthFixPrompt(file: string) {
+  return `Review the API route at ${file}.
+
+Goal:
+Determine whether this route should be public or protected.
+
+Instructions:
+- Inspect the existing authentication/session pattern used in this project.
+- If this route handles private data, user-specific data, uploads, writes, or admin actions, add the existing auth/session check.
+- Do not introduce a new auth provider.
+- Do not refactor unrelated code.
+- Keep the current behavior unchanged.
+- If this route is intentionally public, add a short comment explaining why.
+
+Return:
+- A short explanation of what you changed.
+- The updated code.
+- Any edge cases I should test.`;
+}
+
+function createMissingEnvVariableFixPrompt(variableName: string, files: string[]) {
+  return `Update the environment documentation for this project.
+
+The variable ${variableName} is used in ${formatPromptFileList(files)} but is missing from .env.example.
+
+Instructions:
+- Add ${variableName}= to .env.example.
+- Do not add a real secret value.
+- Check if related environment variables used in the same file should also be documented.
+- Keep comments clear and safe for public repos.
+
+Return:
+- The updated .env.example lines.
+- A short explanation.`;
+}
+
+function createLargeFileFixPrompt(file: string) {
+  return `Review ${file}.
+
+Qodfy detected this as a large file.
+
+Goal:
+Suggest a safe refactor plan without changing behavior.
+
+Instructions:
+- Identify the main responsibilities inside the file.
+- Suggest smaller components, hooks, or utility files that can be extracted.
+- Do not rewrite the whole file at once.
+- Do not change UI behavior.
+- Do not change business logic.
+- Prioritize low-risk extractions first.
+
+Return:
+- A short responsibility breakdown.
+- A step-by-step refactor plan.
+- The safest first extraction.`;
+}
+
+function createAiRateLimitFixPrompt(file: string) {
+  return `Review the AI-related API route at ${file}.
+
+Goal:
+Add cost and abuse protection safely.
+
+Instructions:
+- Check the existing project patterns for auth, usage limits, or rate limiting.
+- If this route can be called by users, add rate limiting or per-user usage protection.
+- Do not introduce a new service unless necessary.
+- Do not change the AI provider or model behavior.
+- Keep the current response format unchanged.
+- If the route is intentionally public, explain why and recommend a safe limit.
+
+Return:
+- The safest protection approach.
+- The updated code.
+- Any environment variables required.`;
+}
+
+function createWebhookSignatureFixPrompt(file: string) {
+  return `Review the webhook API route at ${file}.
+
+Goal:
+Verify that webhook signature validation happens before the event is handled.
+
+Instructions:
+- Detect which provider this webhook belongs to based on imports, headers, and environment variables.
+- Use the provider's existing verification pattern if already present.
+- Do not process the webhook event before verification unless required by the provider.
+- Do not introduce unrelated changes.
+- If verification already exists, explain where it happens.
+
+Return:
+- Whether signature verification exists.
+- If missing, the safest code change.
+- Any test cases to run.`;
+}
+
+function createClientSideSecretFixPrompt(file: string, variableName: string) {
+  return `Review the client-side file at ${file}.
+
+Qodfy found ${variableName}, which does not start with NEXT_PUBLIC_.
+
+Goal:
+Confirm whether this environment variable may be exposed to the browser.
+
+Instructions:
+- Check whether this file is a client component or browser-executed code.
+- If ${variableName} is server-only, move access to a server component, API route, or server action.
+- Do not rename environment variables unless necessary.
+- Do not add real secret values.
+- Keep existing behavior unchanged.
+
+Return:
+- Whether the variable is safe in this file.
+- The safest code change if it is not safe.
+- Any edge cases I should test.`;
+}
+
+function createHardcodedSecretFixPrompt(file: string, secretLabel: string) {
+  return `Review ${file} for a possible hardcoded ${secretLabel}.
+
+Goal:
+Remove any real secret from source code without changing behavior.
+
+Instructions:
+- Do not print or copy the secret value in your response.
+- Move the value to an environment variable if it is a real secret.
+- Add only the variable name to .env.example.
+- Recommend rotating the secret if it may have been committed.
+- Do not refactor unrelated code.
+
+Return:
+- Whether this looks like a real secret.
+- The safest code change.
+- Any follow-up security steps.`;
+}
+
+function createMissingEnvExampleFixPrompt() {
+  return `Create or update .env.example for this project.
+
+Goal:
+Document the environment variables required to run and deploy the app.
+
+Instructions:
+- Inspect process.env usage in the project.
+- Add variable names only.
+- Do not add real secret values.
+- Use empty placeholders like VARIABLE_NAME=.
+- Add short comments only where they help future maintainers.
+
+Return:
+- The proposed .env.example content.
+- A short explanation of any variables that need manual confirmation.`;
+}
+
+function createProjectRootFixPrompt() {
+  return `Review how Qodfy is being run for this project.
+
+Goal:
+Make sure the scanner is pointed at the correct app root.
+
+Instructions:
+- Find the folder that contains the app package.json.
+- If this is a monorepo, identify the Next.js app folder.
+- Do not move files or refactor the project.
+- Recommend the correct qodfy scan --path command.
+
+Return:
+- The correct folder to scan.
+- The exact command to run.`;
+}
+
+function createPackageJsonFixPrompt() {
+  return `Review package.json.
+
+Goal:
+Make package.json readable so tooling can detect the project correctly.
+
+Instructions:
+- Check for invalid JSON syntax.
+- Keep existing dependencies and scripts unchanged unless they are malformed.
+- Do not upgrade dependencies.
+- Do not refactor unrelated files.
+
+Return:
+- The corrected package.json change.
+- A short explanation.`;
+}
+
+function createNextNotDetectedFixPrompt() {
+  return `Review this project structure.
+
+Goal:
+Determine whether Qodfy is scanning the correct Next.js app folder.
+
+Instructions:
+- Check whether this is a monorepo.
+- Find the package.json that includes next as a dependency.
+- Do not install or remove packages.
+- Recommend the correct qodfy scan --path command if needed.
+
+Return:
+- Whether this is a Next.js app.
+- The exact folder Qodfy should scan.`;
+}
+
+function createReadmeFixPrompt() {
+  return `Create a practical README for this project.
+
+Goal:
+Help developers run, configure, and maintain the app.
+
+Instructions:
+- Include setup commands, environment variable documentation, local development, build, and deployment notes.
+- Do not include real secret values.
+- Keep the README concise and accurate.
+- Do not invent features that are not in the project.
+
+Return:
+- The README content.
+- Any assumptions that need confirmation.`;
+}
+
+function formatPromptFileList(files: string[]) {
+  if (files.length === 1) {
+    return files[0];
+  }
+
+  return `${files.length} files: ${formatFileList(files)}`;
 }
 
 function isPackageJsonObject(data: unknown): data is {
