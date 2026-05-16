@@ -126,6 +126,16 @@ type ApiRouteAnalysis = {
   webhookProvider: WebhookProvider;
 };
 
+type MaintainabilityFileKind =
+  | "react-component"
+  | "api-route"
+  | "server-action"
+  | "typescript-module"
+  | "schema-or-validation"
+  | "types"
+  | "config"
+  | "unknown";
+
 type IssueInput = Omit<Issue, "id" | "confidence"> & {
   confidence?: IssueConfidence;
 };
@@ -436,6 +446,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
     if (statResult.size > MAX_FILE_SIZE_BYTES) {
       if (runMaintainabilityChecks) {
         largeFiles++;
+        const largeFileKind = getMaintainabilityFileKind(relativeFile);
 
         addIssue({
           ruleId: "maintainability-large-file-skipped",
@@ -446,7 +457,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
           message: "This file is larger than 500KB and was skipped from deep content checks.",
           file: relativeFile,
           suggestion: "Review large generated or bundled files manually.",
-          fixPrompt: createLargeFileFixPrompt(relativeFile)
+          fixPrompt: createLargeFileFixPrompt(relativeFile, largeFileKind)
         });
       }
       continue;
@@ -611,16 +622,19 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
   }
 
   for (const largeFile of getReportedLargeFiles(largeFileCandidates)) {
+    const largeFileKind = getMaintainabilityFileKind(largeFile.relativeFile);
+    const largeFileCopy = getLargeFileIssueCopy(largeFileKind);
+
     addIssue({
       ruleId: "maintainability-large-file",
       category: "maintainability",
       severity: "info",
       confidence: "low",
-      title: "Large file detected",
-      message: "This file is larger than the recommended maintainability threshold. Large files can be harder to review, test, and safely modify.",
+      title: largeFileCopy.title,
+      message: largeFileCopy.message,
       file: largeFile.relativeFile,
-      suggestion: "Review whether this file mixes UI, state, data fetching, validation, or business logic. If so, split it into smaller components, hooks, or utilities.",
-      fixPrompt: createLargeFileFixPrompt(largeFile.relativeFile)
+      suggestion: largeFileCopy.suggestion,
+      fixPrompt: createLargeFileFixPrompt(largeFile.relativeFile, largeFileKind)
     });
   }
 
@@ -1597,6 +1611,122 @@ function getWebhookSignatureSuggestion(provider: WebhookProvider) {
   return "Verify the provider signature using the raw request body and signature header before trusting the event.";
 }
 
+function getMaintainabilityFileKind(relativeFile: string): MaintainabilityFileKind {
+  const normalizedFile = normalizePath(relativeFile).toLowerCase();
+  const fileName = path.basename(normalizedFile);
+
+  if (
+    /(^|\/)app\/api\/.+\/route\.(?:ts|js)$/.test(normalizedFile) ||
+    /(^|\/)pages\/api\/.+\.(?:ts|js)$/.test(normalizedFile)
+  ) {
+    return "api-route";
+  }
+
+  if (fileName === "actions.ts" || fileName === "actions.tsx") {
+    return "server-action";
+  }
+
+  if (
+    fileName === "schema.ts" ||
+    fileName === "schemas.ts" ||
+    fileName === "validation.ts" ||
+    fileName === "validator.ts"
+  ) {
+    return "schema-or-validation";
+  }
+
+  if (
+    fileName === "types.ts" ||
+    fileName === "type.ts" ||
+    fileName === "interfaces.ts"
+  ) {
+    return "types";
+  }
+
+  if (
+    fileName === "config.ts" ||
+    fileName === "config.js" ||
+    fileName === "next.config.ts" ||
+    fileName === "tailwind.config.ts"
+  ) {
+    return "config";
+  }
+
+  if (normalizedFile.endsWith(".tsx") || normalizedFile.endsWith(".jsx")) {
+    return "react-component";
+  }
+
+  if (/\.(?:ts|js|mts|cts|mjs|cjs)$/.test(normalizedFile)) {
+    return "typescript-module";
+  }
+
+  return "unknown";
+}
+
+function getLargeFileIssueCopy(kind: MaintainabilityFileKind) {
+  if (kind === "react-component") {
+    return {
+      title: "Large React component detected",
+      message: "This component is larger than the recommended maintainability threshold. Large components can be harder to review, test, and safely modify.",
+      suggestion: "Review whether this component mixes UI, state, data fetching, validation, or business logic. If so, split it into smaller components, hooks, or utilities."
+    };
+  }
+
+  if (kind === "typescript-module") {
+    return {
+      title: "Large TypeScript module detected",
+      message: "This module is larger than the recommended maintainability threshold. Large modules can mix business logic, data access, transformations, constants, or helper functions in one place.",
+      suggestion: "Review whether this module mixes unrelated responsibilities such as data fetching, filtering, mapping, sorting, constants, types, or business rules. If so, split it into smaller modules while preserving public exports."
+    };
+  }
+
+  if (kind === "api-route") {
+    return {
+      title: "Large API route detected",
+      message: "This API route is larger than the recommended maintainability threshold. Large route handlers can mix validation, auth, business logic, and response formatting.",
+      suggestion: "Review whether this route mixes validation, authentication, business logic, and response formatting. If so, extract reusable helpers without changing route behavior."
+    };
+  }
+
+  if (kind === "server-action") {
+    return {
+      title: "Large server action file detected",
+      message: "This server action file is larger than the recommended maintainability threshold and may mix validation, data mutations, and business rules.",
+      suggestion: "Review whether this file mixes validation, permission checks, mutations, and formatting. If so, extract helpers while preserving action behavior."
+    };
+  }
+
+  if (kind === "schema-or-validation") {
+    return {
+      title: "Large schema or validation file detected",
+      message: "This schema or validation file is larger than the recommended maintainability threshold and may mix unrelated validation concerns.",
+      suggestion: "Review whether related schemas or validators can be grouped into smaller files while preserving exported names and validation behavior."
+    };
+  }
+
+  if (kind === "types") {
+    return {
+      title: "Large type definition file detected",
+      message: "This type file is larger than the recommended maintainability threshold and may be harder to navigate safely.",
+      suggestion: "Review whether types can be split by domain or feature while preserving public exports and imports."
+    };
+  }
+
+  if (kind === "config") {
+    return {
+      title: "Large config file detected",
+      message: "This config file is larger than the recommended maintainability threshold and may mix unrelated configuration concerns.",
+      suggestion: "Review whether configuration values or helper functions can be moved to smaller supporting modules without changing runtime behavior."
+    };
+  }
+
+  return {
+    title: "Large file detected",
+    message: "This file is larger than the recommended maintainability threshold. Large files can be harder to review, test, and safely modify.",
+    suggestion: "Review whether this file mixes unrelated responsibilities. If so, split it into smaller modules while preserving behavior."
+  };
+}
+
 function createApiAuthFixPrompt(file: string) {
   return `Review the API route at ${file}.
 
@@ -1692,16 +1822,20 @@ Return:
 - A short explanation.`;
 }
 
-function createLargeFileFixPrompt(file: string) {
-  return `Review ${file}.
+function createLargeFileFixPrompt(
+  file: string,
+  kind: MaintainabilityFileKind = getMaintainabilityFileKind(file)
+) {
+  if (kind === "react-component") {
+    return `Review ${file}.
 
-Qodfy detected this as a large file.
+Qodfy detected this as a large React component.
 
 Goal:
 Suggest a safe refactor plan without changing behavior.
 
 Instructions:
-- Identify the main responsibilities inside the file.
+- Identify the main responsibilities inside the component.
 - Suggest smaller components, hooks, or utility files that can be extracted.
 - Do not rewrite the whole file at once.
 - Do not change UI behavior.
@@ -1712,6 +1846,170 @@ Return:
 - A short responsibility breakdown.
 - A step-by-step refactor plan.
 - The safest first extraction.`;
+  }
+
+  if (kind === "typescript-module") {
+    return `Review ${file}.
+
+Qodfy detected this as a large TypeScript module.
+
+Goal:
+Create a safe refactor plan without changing behavior.
+
+Instructions:
+- Identify the main responsibilities inside this module.
+- Check whether the file mixes unrelated concerns such as data fetching, filtering, mapping, sorting, constants, types, validation, or business rules.
+- Suggest smaller TypeScript modules that could be extracted safely.
+- Do not rewrite the whole file at once.
+- Do not change business logic.
+- Do not change public exports unless you also update all imports safely.
+- Preserve existing function behavior, return types, and error handling.
+- Prioritize the lowest-risk extraction first.
+
+Return:
+- Responsibility breakdown.
+- Suggested new file/module structure.
+- Step-by-step refactor plan.
+- The safest first extraction.
+- Tests or manual checks to run.`;
+  }
+
+  if (kind === "api-route") {
+    return `Review the API route at ${file}.
+
+Qodfy detected this as a large API route file.
+
+Goal:
+Create a safe refactor plan without changing HTTP behavior.
+
+Instructions:
+- Identify where validation, authentication, business logic, and response formatting happen.
+- Suggest helper modules that can be extracted without changing the route contract.
+- Preserve HTTP methods, status codes, headers, auth checks, validation behavior, and response shape.
+- Do not rewrite the whole route at once.
+- Do not introduce a new auth provider or validation library.
+- Prioritize the lowest-risk extraction first.
+
+Return:
+- Responsibility breakdown.
+- Suggested helper/module structure.
+- Step-by-step refactor plan.
+- The safest first extraction.
+- Tests or manual checks to run.`;
+  }
+
+  if (kind === "server-action") {
+    return `Review the server action file at ${file}.
+
+Qodfy detected this as a large server action file.
+
+Goal:
+Create a safe refactor plan without changing action behavior.
+
+Instructions:
+- Identify validation, permission checks, mutations, cache invalidation, formatting, and error handling.
+- Suggest helper modules that can be extracted safely.
+- Preserve permissions, validation behavior, data mutations, cache invalidation, return shape, and error handling.
+- Do not rewrite the whole file at once.
+- Do not change public action names unless you also update every import safely.
+- Prioritize the lowest-risk extraction first.
+
+Return:
+- Responsibility breakdown.
+- Suggested helper/module structure.
+- Step-by-step refactor plan.
+- The safest first extraction.
+- Tests or manual checks to run.`;
+  }
+
+  if (kind === "schema-or-validation") {
+    return `Review the schema or validation file at ${file}.
+
+Qodfy detected this as a large validation-focused file.
+
+Goal:
+Create a safe refactor plan without changing validation behavior.
+
+Instructions:
+- Identify related schemas, validators, shared constants, and inferred types.
+- Suggest smaller validation modules grouped by feature or domain.
+- Do not change validation rules, error messages, inferred types, or public exports unless you also update all imports safely.
+- Prioritize the lowest-risk extraction first.
+
+Return:
+- Responsibility breakdown.
+- Suggested file/module structure.
+- Step-by-step refactor plan.
+- The safest first extraction.
+- Tests or manual checks to run.`;
+  }
+
+  if (kind === "types") {
+    return `Review the type definition file at ${file}.
+
+Qodfy detected this as a large type file.
+
+Goal:
+Create a safe organization plan without changing runtime behavior.
+
+Instructions:
+- Identify groups of related types, interfaces, enums, and exported utility types.
+- Suggest smaller type modules grouped by domain or feature.
+- Do not change type names, public exports, or imports unless you also update all references safely.
+- Prioritize the lowest-risk extraction first.
+
+Return:
+- Type responsibility breakdown.
+- Suggested file/module structure.
+- Step-by-step refactor plan.
+- The safest first extraction.
+- Type-check command to run.`;
+  }
+
+  if (kind === "config") {
+    return `Review the config file at ${file}.
+
+Qodfy detected this as a large config file.
+
+Goal:
+Create a safe simplification plan without changing runtime configuration.
+
+Instructions:
+- Identify config sections, constants, plugin setup, and helper functions.
+- Suggest supporting modules only if extraction reduces complexity.
+- Preserve all existing config values, plugin order, environment behavior, and exports.
+- Do not upgrade dependencies or change framework behavior.
+- Prioritize the lowest-risk extraction first.
+
+Return:
+- Config responsibility breakdown.
+- Suggested supporting module structure.
+- Step-by-step refactor plan.
+- The safest first extraction.
+- Build or validation command to run.`;
+  }
+
+  return `Review ${file}.
+
+Qodfy detected this as a large file.
+
+Goal:
+Create a safe refactor plan without changing behavior.
+
+Instructions:
+- Identify the main responsibilities inside the file.
+- Suggest smaller files or modules that can be extracted safely.
+- Do not rewrite the whole file at once.
+- Do not change public exports unless you also update all imports safely.
+- Preserve existing behavior, return values, and error handling.
+- Prioritize the lowest-risk extraction first.
+
+Return:
+- Responsibility breakdown.
+- Suggested file/module structure.
+- Step-by-step refactor plan.
+- The safest first extraction.
+- Tests or manual checks to run.`;
 }
 
 function createAiRateLimitFixPrompt(file: string) {
