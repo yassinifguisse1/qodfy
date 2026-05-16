@@ -43,6 +43,7 @@ type PromptCommandOptions = {
 
 type ScanMode = "recommended" | "security-api" | "environment" | "ai" | "webhook" | "maintainability" | "custom";
 
+const CLI_VERSION = "0.2.7";
 const DEFAULT_MAX_ISSUES = 5;
 
 const program = new Command();
@@ -50,7 +51,7 @@ const program = new Command();
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.2.4");
+  .version(CLI_VERSION);
 
 program
   .command("scan")
@@ -139,7 +140,7 @@ program
       return;
     }
 
-    const report = await scanProject({
+    const report: ScanReport = await scanProject({
       projectPath: pathResult.projectPath,
       checks: checksResult.checks,
       includeLowConfidence: true
@@ -659,6 +660,10 @@ function printIssue(
     printEvidence(issue.evidence);
   }
 
+  if ((showDetails || showPrompts) && issue.context && issue.context.length > 0) {
+    printContext(issue.context);
+  }
+
   if ((showDetails || showPrompts) && issue.suggestion) {
     console.log(pc.dim(`Suggestion: ${issue.suggestion}`));
   }
@@ -686,6 +691,10 @@ function printFixPrompt(issue: Issue) {
     printEvidence(issue.evidence);
   }
 
+  if (issue.context && issue.context.length > 0) {
+    printContext(issue.context);
+  }
+
   console.log("");
   console.log(issue.fixPrompt);
 }
@@ -695,6 +704,16 @@ function printEvidence(evidence: NonNullable<Issue["evidence"]>) {
   console.log(pc.bold("Evidence:"));
 
   for (const item of evidence) {
+    const detail = item.detail ? ` ${item.detail}` : "";
+    console.log(pc.dim(`- ${item.label}${detail}`));
+  }
+}
+
+function printContext(context: NonNullable<Issue["context"]>) {
+  console.log("");
+  console.log(pc.bold("Context:"));
+
+  for (const item of context) {
     const detail = item.detail ? ` ${item.detail}` : "";
     console.log(pc.dim(`- ${item.label}${detail}`));
   }
