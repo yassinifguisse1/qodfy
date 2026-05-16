@@ -4,6 +4,10 @@ import fg from "fast-glob";
 
 export type IssueSeverity = "critical" | "warning" | "info";
 export type IssueConfidence = "high" | "medium" | "low";
+export type IssueEvidence = {
+  label: string;
+  detail?: string;
+};
 
 export type IssueCategory =
   | "security"
@@ -46,6 +50,7 @@ export type Issue = {
   file?: string;
   suggestion?: string;
   fixPrompt?: string;
+  evidence?: IssueEvidence[];
 };
 
 export type ScanReport = {
@@ -100,6 +105,26 @@ type ApiRouteIntent =
   | "internal"
   | "sensitive-mutation"
   | "unknown";
+
+type ApiRouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+type ApiRouteAnalysis = {
+  file: string;
+  relativeFile: string;
+  methods: ApiRouteMethod[];
+  intent: ApiRouteIntent;
+  authExpected: boolean | "review";
+  confidence: IssueConfidence;
+  evidence: IssueEvidence[];
+  hasAuth: boolean;
+  hasSecretProtection: boolean;
+  hasRateLimit: boolean;
+  hasValidation: boolean;
+  hasCacheHeaders: boolean;
+  hasMethodBlocking: boolean;
+  hasWebhookVerification: boolean;
+  webhookProvider: WebhookProvider;
+};
 
 type IssueInput = Omit<Issue, "id" | "confidence"> & {
   confidence?: IssueConfidence;
@@ -207,10 +232,11 @@ const issueIdPrefixes: Record<string, string> = {
   "environment-variable-missing-from-example": "environment-variable-missing-from-example",
   "security-client-side-secret": "security-client-side-secret",
   "security-hardcoded-secret": "security-hardcoded-secret",
-  "api-route-missing-auth": "security-api-auth",
+  "sensitive-api-route-missing-auth": "sensitive-api-route-missing-auth",
   "api-public-read-route": "api-public-read-route",
-  "api-public-form-abuse-protection": "api-public-form-protection",
-  "api-internal-route-protection": "api-internal-route-protection",
+  "public-form-missing-abuse-protection": "public-form-missing-abuse-protection",
+  "internal-route-missing-protection": "internal-route-missing-protection",
+  "api-mutation-route-review-auth": "api-mutation-route-review-auth",
   "ai-route-missing-rate-limit": "ai-route-rate-limit",
   "maintainability-large-file": "maintainability-large-file",
   "maintainability-large-file-skipped": "maintainability-large-file-skipped",
@@ -459,11 +485,7 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
     if (runAiChecks && usesAI) {
       aiFiles++;
 
-      const hasRateLimit =
-        content.includes("rateLimit") ||
-        content.includes("ratelimit") ||
-        content.includes("upstash") ||
-        content.includes("limiter");
+      const hasRateLimit = hasRateLimitSignal(content);
 
       if (apiRouteSet.has(file) && !hasRateLimit) {
         addIssue({
@@ -480,24 +502,30 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       }
     }
 
-    const webhookRouteInfo = (runWebhookChecks || runApiChecks) && apiRouteSet.has(file)
-      ? getWebhookRouteInfo(relativeFile, content)
+    const apiRouteAnalysis = (runWebhookChecks || runApiChecks) && apiRouteSet.has(file)
+      ? analyzeApiRoute({
+        file,
+        relativeFile,
+        content
+      })
       : null;
 
     if (
-      webhookRouteInfo &&
-      !hasWebhookSignatureVerification(content, webhookRouteInfo.provider)
+      runWebhookChecks &&
+      apiRouteAnalysis?.intent === "webhook" &&
+      !apiRouteAnalysis.hasWebhookVerification
     ) {
       addIssue({
         ruleId: "webhook-missing-signature-verification",
         category: "webhook",
-        severity: webhookRouteInfo.confidence === "high" ? "critical" : "warning",
-        confidence: webhookRouteInfo.confidence === "high" ? "high" : "medium",
+        severity: apiRouteAnalysis.confidence === "high" ? "critical" : "warning",
+        confidence: apiRouteAnalysis.confidence,
         title: "Webhook route may be missing signature verification",
         message: "This webhook route appears to handle external events, but Qodfy could not find signature verification before the event is handled.",
         file: relativeFile,
-        suggestion: getWebhookSignatureSuggestion(webhookRouteInfo.provider),
-        fixPrompt: createWebhookSignatureFixPrompt(relativeFile)
+        suggestion: getWebhookSignatureSuggestion(apiRouteAnalysis.webhookProvider),
+        fixPrompt: createWebhookSignatureFixPrompt(relativeFile),
+        evidence: apiRouteAnalysis.evidence
       });
     }
 
@@ -525,13 +553,11 @@ export async function scanProject(input: string | ScanOptions): Promise<ScanRepo
       }
     }
 
-    if (runApiChecks && apiRouteSet.has(file)) {
+    if (runApiChecks && apiRouteAnalysis) {
       addApiRouteProtectionIssues({
         addIssue,
-        content,
         includeLowConfidence,
-        relativeFile,
-        webhookRouteInfo
+        analysis: apiRouteAnalysis
       });
     }
 
@@ -921,133 +947,143 @@ function isApiRoute(filePath: string) {
 
 function addApiRouteProtectionIssues({
   addIssue,
-  content,
   includeLowConfidence,
-  relativeFile,
-  webhookRouteInfo
+  analysis
 }: {
   addIssue: AddIssue;
-  content: string;
   includeLowConfidence: boolean;
-  relativeFile: string;
-  webhookRouteInfo: WebhookRouteInfo | null;
+  analysis: ApiRouteAnalysis;
 }) {
-  const intent = classifyApiRouteIntent(relativeFile, content, webhookRouteInfo);
-  const hasAuth = hasAuthOrSessionCheck(content);
-  const methods = getHttpMethods(content);
-
-  if (intent === "webhook") {
+  if (analysis.intent === "webhook") {
     return;
   }
 
-  if (intent === "public-read") {
+  if (analysis.intent === "public-read") {
     if (includeLowConfidence) {
       addIssue({
         ruleId: "api-public-read-route",
         category: "api",
         severity: "info",
-        confidence: "low",
+        confidence: analysis.confidence,
         title: "Public read API route detected",
         message: "This route appears intentionally public. Authentication may not be required.",
-        file: relativeFile,
+        file: analysis.relativeFile,
         suggestion: "Verify that it only exposes public or published data and has appropriate validation, caching, and abuse protection.",
-        fixPrompt: createPublicReadRouteFixPrompt(relativeFile)
+        fixPrompt: createPublicReadRouteFixPrompt(analysis.relativeFile),
+        evidence: analysis.evidence
       });
     }
 
     return;
   }
 
-  if (intent === "public-form") {
-    if (!hasAbuseProtection(content)) {
+  if (analysis.intent === "public-form") {
+    if (!analysis.hasRateLimit && !analysis.hasValidation) {
       addIssue({
-        ruleId: "api-public-form-abuse-protection",
+        ruleId: "public-form-missing-abuse-protection",
         category: "api",
         severity: "warning",
-        confidence: "medium",
+        confidence: analysis.confidence,
         title: "Public form route may be missing abuse protection",
         message: "This route appears to accept public submissions. Consider adding rate limiting, validation, or spam protection.",
-        file: relativeFile,
+        file: analysis.relativeFile,
         suggestion: "Check for rate limiting, validation, captcha, Turnstile, reCAPTCHA, hCaptcha, or another spam protection pattern.",
-        fixPrompt: createPublicFormProtectionFixPrompt(relativeFile)
+        fixPrompt: createPublicFormProtectionFixPrompt(analysis.relativeFile),
+        evidence: analysis.evidence
       });
     }
 
     return;
   }
 
-  if (intent === "internal") {
-    if (!hasInternalRouteProtection(content)) {
+  if (analysis.intent === "internal") {
+    if (!analysis.hasAuth && !analysis.hasSecretProtection) {
       addIssue({
-        ruleId: "api-internal-route-protection",
-        category: "api",
+        ruleId: "internal-route-missing-protection",
+        category: "security",
         severity: "warning",
-        confidence: "high",
+        confidence: analysis.confidence,
         title: "Internal API route may be missing protection",
         message: "This route appears internal or operational. Confirm it is protected by auth, a secret token, or server-only access.",
-        file: relativeFile,
+        file: analysis.relativeFile,
         suggestion: "Use the project's existing auth pattern or a secret token check for operational routes such as cron, cleanup, or revalidation.",
-        fixPrompt: createInternalRouteProtectionFixPrompt(relativeFile)
+        fixPrompt: createInternalRouteProtectionFixPrompt(analysis.relativeFile),
+        evidence: analysis.evidence
       });
     }
 
     return;
   }
 
-  if (intent === "sensitive-mutation") {
-    if (!hasAuth) {
+  if (analysis.intent === "sensitive-mutation") {
+    if (!analysis.hasAuth) {
       addIssue({
-        ruleId: "api-route-missing-auth",
-        category: "api",
+        ruleId: "sensitive-api-route-missing-auth",
+        category: "security",
         severity: "warning",
-        confidence: "high",
+        confidence: analysis.confidence,
         title: "Sensitive API route may be missing authentication",
         message: "This route appears to handle user-specific or sensitive operations. Confirm it is protected before launch.",
-        file: relativeFile,
+        file: analysis.relativeFile,
         suggestion: "Review the existing project auth/session pattern and apply it if this route handles private data, uploads, payments, or account changes.",
-        fixPrompt: createApiAuthFixPrompt(relativeFile)
+        fixPrompt: createApiAuthFixPrompt(analysis.relativeFile),
+        evidence: analysis.evidence
       });
     }
 
     return;
   }
 
-  if (hasMutationMethod(methods) && !hasAuth) {
+  if (analysis.authExpected === "review" && !analysis.hasAuth) {
     addIssue({
-      ruleId: "api-route-missing-auth",
+      ruleId: "api-mutation-route-review-auth",
       category: "api",
       severity: "warning",
-      confidence: "medium",
+      confidence: analysis.confidence,
       title: "API mutation route should be reviewed for authentication",
-      message: "This route appears to handle a mutation, but Qodfy could not find an auth/session check.",
-      file: relativeFile,
+      message: "This route mutates data or handles requests, but Qodfy could not determine whether authentication is required.",
+      file: analysis.relativeFile,
       suggestion: "Confirm the route is intentionally public, or add the existing project auth/session check before handling private data.",
-      fixPrompt: createApiAuthFixPrompt(relativeFile)
+      fixPrompt: createApiAuthFixPrompt(analysis.relativeFile),
+      evidence: analysis.evidence
     });
   }
 }
 
-function classifyApiRouteIntent(
-  relativeFile: string,
-  content: string,
-  webhookRouteInfo: WebhookRouteInfo | null
-): ApiRouteIntent {
+function analyzeApiRoute({
+  file,
+  relativeFile,
+  content
+}: {
+  file: string;
+  relativeFile: string;
+  content: string;
+}): ApiRouteAnalysis {
   const normalizedFile = relativeFile.toLowerCase();
-  const methods = getHttpMethods(content);
+  const methods = getRouteHttpMethods(content);
+  const evidence: IssueEvidence[] = [];
+  const webhookRouteInfo = getWebhookRouteInfo(relativeFile, content);
+  const hasAuth = hasAuthOrSessionCheck(content);
+  const hasSecretProtection = hasSecretProtectionSignal(content);
+  const hasRateLimit = hasRateLimitSignal(content);
+  const hasValidation = hasValidationSignal(content);
+  const hasCacheHeaders = hasCacheHeaderSignal(content);
+  const hasMethodBlocking = hasMethodBlockingSignal(content);
+  const webhookProvider = webhookRouteInfo?.provider ?? "unknown";
+  const hasWebhookVerification = hasWebhookSignatureVerification(content, webhookProvider);
 
-  if (webhookRouteInfo || routePathHasAny(normalizedFile, ["webhook", "webhooks", "callback"])) {
-    return "webhook";
+  if (methods.length > 0) {
+    for (const method of methods) {
+      evidence.push({ label: "exports", detail: method });
+    }
+  } else {
+    evidence.push({ label: "no exported HTTP method detected" });
   }
 
-  if (routePathHasAny(normalizedFile, ["internal", "admin", "cron", "cleanup", "revalidate", "private"])) {
-    return "internal";
-  }
-
-  if (routePathHasAny(normalizedFile, ["contact", "subscribe", "newsletter", "lead", "inquiry"])) {
-    return "public-form";
-  }
-
-  if (routePathHasAny(normalizedFile, [
+  const webhookPathMatch = getRoutePathMatch(normalizedFile, ["webhook", "webhooks", "callback"]);
+  const internalPathMatch = getRoutePathMatch(normalizedFile, ["internal", "admin", "cron", "cleanup", "revalidate", "private"]);
+  const formPathMatch = getRoutePathMatch(normalizedFile, ["contact", "subscribe", "newsletter", "lead", "inquiry"]);
+  const sensitivePathMatch = getRoutePathMatch(normalizedFile, [
     "upload",
     "checkout",
     "order",
@@ -1062,11 +1098,8 @@ function classifyApiRouteIntent(
     "cart",
     "profile",
     "settings"
-  ])) {
-    return "sensitive-mutation";
-  }
-
-  if (routePathHasAny(normalizedFile, [
+  ]);
+  const publicContentPathMatch = getRoutePathMatch(normalizedFile, [
     "blog",
     "blogs",
     "post",
@@ -1079,56 +1112,163 @@ function classifyApiRouteIntent(
     "categories",
     "sitemap",
     "rss"
-  ])) {
-    return "public-read";
+  ]);
+
+  let intent: ApiRouteIntent = "unknown";
+
+  if (webhookRouteInfo || webhookPathMatch) {
+    intent = "webhook";
+    evidence.push({
+      label: webhookPathMatch ? "webhook path detected" : "webhook content detected",
+      detail: webhookPathMatch ?? webhookProvider
+    });
+  } else if (internalPathMatch) {
+    intent = "internal";
+    evidence.push({ label: "path contains", detail: internalPathMatch });
+  } else if (formPathMatch) {
+    intent = "public-form";
+    evidence.push({ label: "path contains", detail: formPathMatch });
+  } else if (hasMutationMethod(methods) && sensitivePathMatch) {
+    intent = "sensitive-mutation";
+    evidence.push({ label: "path contains", detail: sensitivePathMatch });
+  } else if (methods.includes("GET") && publicContentPathMatch && !sensitivePathMatch && !internalPathMatch) {
+    intent = "public-read";
+    evidence.push({ label: "public content route detected", detail: publicContentPathMatch });
   }
 
-  if (hasMutationMethod(methods)) {
-    return "unknown";
+  if (hasAuth) {
+    evidence.push({ label: "auth/session check detected" });
+  } else {
+    evidence.push({ label: "no auth/session check detected" });
   }
 
-  if (methods.size === 0 || isReadOnlyRoute(methods)) {
-    return "unknown";
+  if (hasSecretProtection) {
+    evidence.push({ label: "secret token check detected" });
   }
 
-  return "unknown";
+  if (hasRateLimit) {
+    evidence.push({ label: "rate limit detected" });
+  } else if (intent === "public-form") {
+    evidence.push({ label: "no rate limit detected" });
+  }
+
+  if (hasValidation) {
+    evidence.push({ label: "validation detected" });
+  } else if (intent === "public-form") {
+    evidence.push({ label: "no validation detected" });
+  }
+
+  if (hasCacheHeaders) {
+    evidence.push({ label: "cache/public-read safety signal detected" });
+  }
+
+  if (hasMethodBlocking) {
+    evidence.push({ label: "method blocking detected" });
+  }
+
+  if (intent === "webhook") {
+    if (hasWebhookVerification) {
+      evidence.push({ label: "webhook signature verification detected" });
+    } else {
+      evidence.push({ label: "no webhook signature verification detected" });
+    }
+  }
+
+  return {
+    file,
+    relativeFile,
+    methods,
+    intent,
+    authExpected: getAuthExpectation(intent, methods),
+    confidence: getApiRouteConfidence(intent, methods, webhookRouteInfo),
+    evidence,
+    hasAuth,
+    hasSecretProtection,
+    hasRateLimit,
+    hasValidation,
+    hasCacheHeaders,
+    hasMethodBlocking,
+    hasWebhookVerification,
+    webhookProvider
+  };
 }
 
-function routePathHasAny(normalizedFile: string, terms: string[]) {
-  return terms.some((term) => {
+function getAuthExpectation(intent: ApiRouteIntent, methods: ApiRouteMethod[]): boolean | "review" {
+  if (intent === "internal" || intent === "sensitive-mutation") {
+    return true;
+  }
+
+  if (intent === "unknown" && hasMutationMethod(methods)) {
+    return "review";
+  }
+
+  return false;
+}
+
+function getApiRouteConfidence(
+  intent: ApiRouteIntent,
+  methods: ApiRouteMethod[],
+  webhookRouteInfo: WebhookRouteInfo | null
+): IssueConfidence {
+  if (intent === "sensitive-mutation" || intent === "internal") {
+    return "high";
+  }
+
+  if (intent === "webhook") {
+    return webhookRouteInfo?.confidence === "high" ? "high" : "medium";
+  }
+
+  if (intent === "public-form" || (intent === "unknown" && hasMutationMethod(methods))) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+function getRoutePathMatch(normalizedFile: string, terms: string[]) {
+  return terms.find((term) => {
     const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
     return new RegExp(`(^|[\\/._\\[\\]-])${escapedTerm}([\\/._\\[\\]-]|$)`).test(normalizedFile);
   });
 }
 
-function getHttpMethods(content: string) {
-  const methods = new Set<string>();
-  const exportedMethodPattern = /\bexport\s+(?:async\s+)?(?:function|const)\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/g;
-  const requestMethodPattern = /\b(?:request|req)\.method\s*(?:={2,3}|!={1,2})\s*["'](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)["']/g;
-  const methodCasePattern = /\bcase\s+["'](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)["']/g;
+function getExportedHttpMethods(content: string): ApiRouteMethod[] {
+  const methods = new Set<ApiRouteMethod>();
+  const functionExportPattern = /\bexport\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b/g;
+  const constExportPattern = /\bexport\s+const\s+(GET|POST|PUT|PATCH|DELETE)\b/g;
 
-  for (const match of content.matchAll(exportedMethodPattern)) {
-    methods.add(match[1]);
+  for (const match of content.matchAll(functionExportPattern)) {
+    methods.add(match[1] as ApiRouteMethod);
   }
 
+  for (const match of content.matchAll(constExportPattern)) {
+    methods.add(match[1] as ApiRouteMethod);
+  }
+
+  return [...methods];
+}
+
+function getRouteHttpMethods(content: string): ApiRouteMethod[] {
+  const methods = new Set<ApiRouteMethod>(getExportedHttpMethods(content));
+  const requestMethodPattern = /\b(?:request|req)\.method\s*(?:={2,3}|!={1,2})\s*["'](GET|POST|PUT|PATCH|DELETE)["']/g;
+  const methodCasePattern = /\bcase\s+["'](GET|POST|PUT|PATCH|DELETE)["']/g;
+
   for (const match of content.matchAll(requestMethodPattern)) {
-    methods.add(match[1]);
+    methods.add(match[1] as ApiRouteMethod);
   }
 
   for (const match of content.matchAll(methodCasePattern)) {
-    methods.add(match[1]);
+    methods.add(match[1] as ApiRouteMethod);
   }
 
-  return methods;
+  return [...methods];
 }
 
-function hasMutationMethod(methods: Set<string>) {
-  return ["POST", "PUT", "PATCH", "DELETE"].some((method) => methods.has(method));
-}
-
-function isReadOnlyRoute(methods: Set<string>) {
-  return [...methods].every((method) => method === "GET" || method === "HEAD" || method === "OPTIONS");
+function hasMutationMethod(methods: ApiRouteMethod[]) {
+  return ["POST", "PUT", "PATCH", "DELETE"].some((method) =>
+    methods.includes(method as ApiRouteMethod)
+  );
 }
 
 function hasAuthOrSessionCheck(content: string) {
@@ -1154,11 +1294,10 @@ function hasAuthOrSessionCheck(content: string) {
   );
 }
 
-function hasInternalRouteProtection(content: string) {
+function hasSecretProtectionSignal(content: string) {
   const normalizedContent = content.toLowerCase();
 
   return (
-    hasAuthOrSessionCheck(content) ||
     /\bprocess\.env\.[A-Za-z0-9_]*SECRET\b/.test(content) ||
     /\bprocess\.env\[['"`][A-Za-z0-9_]*SECRET['"`]\]/.test(content) ||
     normalizedContent.includes("cron_secret") ||
@@ -1169,21 +1308,58 @@ function hasInternalRouteProtection(content: string) {
   );
 }
 
-function hasAbuseProtection(content: string) {
+function hasRateLimitSignal(content: string) {
   const normalizedContent = content.toLowerCase();
 
   return (
     normalizedContent.includes("ratelimit") ||
     normalizedContent.includes("rate limit") ||
     normalizedContent.includes("limiter") ||
+    normalizedContent.includes("upstash") ||
+    normalizedContent.includes("throttle")
+  );
+}
+
+function hasValidationSignal(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    normalizedContent.includes("zod") ||
+    normalizedContent.includes("schema") ||
+    normalizedContent.includes("validate") ||
+    normalizedContent.includes("validation") ||
+    normalizedContent.includes("sanitize") ||
+    normalizedContent.includes("safeparse") ||
+    normalizedContent.includes("parse(") ||
+    normalizedContent.includes("slugregex") ||
+    normalizedContent.includes("isvalid") ||
     normalizedContent.includes("captcha") ||
     normalizedContent.includes("turnstile") ||
     normalizedContent.includes("recaptcha") ||
-    normalizedContent.includes("hcaptcha") ||
-    normalizedContent.includes("validation") ||
-    normalizedContent.includes("validate") ||
-    normalizedContent.includes("zod") ||
-    normalizedContent.includes("safeparse")
+    normalizedContent.includes("hcaptcha")
+  );
+}
+
+function hasCacheHeaderSignal(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    normalizedContent.includes("cache-control") ||
+    normalizedContent.includes("s-maxage") ||
+    normalizedContent.includes("stale-while-revalidate") ||
+    normalizedContent.includes("public") ||
+    normalizedContent.includes("published") ||
+    normalizedContent.includes("status")
+  );
+}
+
+function hasMethodBlockingSignal(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    normalizedContent.includes("method not allowed") ||
+    normalizedContent.includes("status: 405") ||
+    /\b405\b/.test(normalizedContent)
   );
 }
 

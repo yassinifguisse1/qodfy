@@ -50,7 +50,7 @@ const program = new Command();
 program
   .name("qodfy")
   .description("Launch readiness scanner for AI-built apps.")
-  .version("0.2.3");
+  .version("0.2.4");
 
 program
   .command("scan")
@@ -644,7 +644,8 @@ function printIssue(
   projectPath: string
 ) {
   console.log("");
-  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)} ${pc.dim(`(${issue.confidence} confidence)`)}`);
+  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)}`);
+  console.log(pc.dim(`Confidence: ${issue.confidence}`));
 
   if (issue.file) {
     console.log(pc.dim(`File: ${issue.file}`));
@@ -652,6 +653,10 @@ function printIssue(
 
   if (showDetails || showPrompts) {
     console.log(issue.message);
+  }
+
+  if ((showDetails || showPrompts) && issue.evidence && issue.evidence.length > 0) {
+    printEvidence(issue.evidence);
   }
 
   if ((showDetails || showPrompts) && issue.suggestion) {
@@ -670,14 +675,29 @@ function printIssue(
 function printFixPrompt(issue: Issue) {
   console.log(pc.bold("Qodfy Fix Prompt"));
   console.log("");
-  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)} ${pc.dim(`(${issue.confidence} confidence)`)}`);
+  console.log(`${pc.dim(`[${issue.id}]`)} ${getSeverityLabel(issue.severity)} ${pc.bold(issue.title)}`);
+  console.log(pc.dim(`Confidence: ${issue.confidence}`));
 
   if (issue.file) {
     console.log(pc.dim(`File: ${issue.file}`));
   }
 
+  if (issue.evidence && issue.evidence.length > 0) {
+    printEvidence(issue.evidence);
+  }
+
   console.log("");
   console.log(issue.fixPrompt);
+}
+
+function printEvidence(evidence: NonNullable<Issue["evidence"]>) {
+  console.log("");
+  console.log(pc.bold("Evidence:"));
+
+  for (const item of evidence) {
+    const detail = item.detail ? ` ${item.detail}` : "";
+    console.log(pc.dim(`- ${item.label}${detail}`));
+  }
 }
 
 function printPromptFromReport(report: ScanReport, issueId: string) {
@@ -778,8 +798,19 @@ function getTopPriorities(issues: Issue[]) {
       message: "Move possible server-only secrets out of client-side code."
     },
     {
-      ruleIds: ["api-route-missing-auth"],
+      ruleIds: [
+        "sensitive-api-route-missing-auth",
+        "api-mutation-route-review-auth"
+      ],
       message: "Review API routes that may be missing authentication."
+    },
+    {
+      ruleIds: ["internal-route-missing-protection"],
+      message: "Protect internal or operational API routes before launch."
+    },
+    {
+      ruleIds: ["public-form-missing-abuse-protection"],
+      message: "Add abuse protection to public form routes."
     },
     {
       ruleIds: [
