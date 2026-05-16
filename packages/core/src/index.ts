@@ -135,11 +135,17 @@ const sourceFilePatterns = ["**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"];
 
 const ignoredPaths = [
   "node_modules/**",
+  "**/node_modules/**",
   ".next/**",
+  "**/.next/**",
   "dist/**",
+  "**/dist/**",
   "build/**",
+  "**/build/**",
   ".turbo/**",
+  "**/.turbo/**",
   ".vercel/**",
+  "**/.vercel/**",
   "coverage/**",
   "**/coverage/**",
   ".cache/**",
@@ -789,12 +795,18 @@ async function safeReadJson(filePath: string): Promise<SafeJsonResult> {
 
 async function getSourceFiles(projectPath: string, addIssue: AddIssue) {
   try {
-    const files = await fg(sourceFilePatterns, {
+    const rawFiles = await fg(sourceFilePatterns, {
       cwd: projectPath,
       ignore: ignoredPaths,
       absolute: true,
       onlyFiles: true,
       dot: false
+    });
+
+    const files = rawFiles.filter((file) => {
+      const relativeFile = normalizePath(path.relative(projectPath, file));
+
+      return !shouldIgnoreSourceFile(relativeFile);
     });
 
     return files.sort((leftFile, rightFile) =>
@@ -814,6 +826,37 @@ async function getSourceFiles(projectPath: string, addIssue: AddIssue) {
 
     return [];
   }
+}
+
+function shouldIgnoreSourceFile(relativeFile: string) {
+  const normalizedFile = normalizePath(relativeFile);
+  const pathParts = normalizedFile.split("/");
+  const ignoredPathParts = new Set([
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+    ".turbo",
+    ".vercel",
+    "coverage",
+    ".cache",
+    ".output",
+    ".open-next",
+    "storybook-static",
+    "playwright-report",
+    "test-results",
+    "generated",
+    "__generated__"
+  ]);
+
+  if (
+    normalizedFile.endsWith(".d.ts") ||
+    normalizedFile.endsWith(".map")
+  ) {
+    return true;
+  }
+
+  return pathParts.some((pathPart) => ignoredPathParts.has(pathPart));
 }
 
 function getEnvExampleVariables(content: string) {
