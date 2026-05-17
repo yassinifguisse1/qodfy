@@ -1,7 +1,7 @@
 {
   "name": "qodfy-monorepo",
   "private": true,
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Open-source launch readiness scanner for AI-built apps.",
   "scripts": {
     "dev": "pnpm dev:web",

@@ -43,7 +43,7 @@ type PromptCommandOptions = {
 
 type ScanMode = "recommended" | "security-api" | "environment" | "ai" | "webhook" | "maintainability" | "custom";
 
-const CLI_VERSION = "0.2.7";
+const CLI_VERSION = "0.2.8";
 const DEFAULT_MAX_ISSUES = 5;
 
 const program = new Command();
