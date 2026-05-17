@@ -59,7 +59,7 @@ type OutputScanReport = {
   issues: Issue[];
 };
 
-const CLI_VERSION = "0.2.9";
+const CLI_VERSION = "0.2.10";
 const DEFAULT_MAX_ISSUES = 5;
 
 const program = new Command();
