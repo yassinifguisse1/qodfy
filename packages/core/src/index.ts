@@ -106,7 +106,17 @@ type ImportInfo = {
   isProtectionSource: boolean;
 };
 
+type LocalHelperInfo = {
+  name: string;
+  body: string;
+};
+
 type SensitiveOperationSignal = {
+  label: string;
+  index: number;
+};
+
+type InputParsingSignal = {
   label: string;
   index: number;
 };
@@ -114,7 +124,18 @@ type SensitiveOperationSignal = {
 type HandlerProtectionAnalysis = {
   hasAccessControlGuard: boolean;
   evidence: IssueEvidence[];
+  inputParsingOperation?: InputParsingSignal;
   sensitiveOperation?: SensitiveOperationSignal;
+};
+
+type SecretProtectionAnalysis = {
+  hasSecretProtectionGuard: boolean;
+  evidence: IssueEvidence[];
+};
+
+type AdminAuthorizationAnalysis = {
+  hasAdminAuthorization: boolean;
+  evidence: IssueEvidence[];
 };
 
 type ApiHandlerIntent =
@@ -136,8 +157,12 @@ type ApiHandlerAnalysis = {
   context?: IssueEvidence[];
   hasAuth: boolean;
   hasSecretProtection: boolean;
+  hasAdminAuthorization: boolean;
   hasRateLimit: boolean;
+  hasBasicValidation: boolean;
+  hasSchemaValidation: boolean;
   hasValidation: boolean;
+  hasSpamProtection: boolean;
   hasCacheHeaders: boolean;
   hasMethodBlocking: boolean;
   hasWebhookVerification: boolean;
@@ -279,6 +304,7 @@ const issueIdPrefixes: Record<string, string> = {
   "api-public-read-route": "api-public-read-route",
   "public-form-missing-abuse-protection": "public-form-missing-abuse-protection",
   "internal-route-missing-protection": "internal-route-missing-protection",
+  "admin-route-missing-authorization": "admin-route-authorization",
   "api-mutation-route-review-auth": "api-mutation-route-review-auth",
   "ai-route-missing-rate-limit": "ai-route-rate-limit",
   "maintainability-large-file": "maintainability-large-file",
@@ -1025,7 +1051,7 @@ function addWebhookSignatureIssues({
   analysis: ApiRouteAnalysis;
 }) {
   for (const handler of analysis.handlers) {
-    if (handler.intent !== "webhook" || handler.hasWebhookVerification) {
+    if (handler.intent !== "webhook" || handler.hasWebhookVerification || handler.hasMethodBlocking) {
       continue;
     }
 
@@ -1059,6 +1085,32 @@ function addApiRouteProtectionIssues({
       continue;
     }
 
+    if (handler.hasMethodBlocking) {
+      continue;
+    }
+
+    const adminPathMatch = getAdminRoutePathMatch(analysis.relativeFile);
+
+    if (adminPathMatch && handler.hasAuth && !handler.hasAdminAuthorization) {
+      addIssue({
+        ruleId: "admin-route-missing-authorization",
+        category: "security",
+        severity: "warning",
+        confidence: "medium",
+        title: `Admin ${handler.method} handler may be missing admin authorization`,
+        message: `The ${handler.method} handler is authenticated, but this route appears to expose admin, private, or debug functionality and Qodfy could not find a role, staff, or permission check.`,
+        file: analysis.relativeFile,
+        suggestion: "Confirm this route is restricted to admins/staff, or remove it before production if it is only for debugging.",
+        fixPrompt: createAdminAuthorizationFixPrompt(analysis.relativeFile, handler.method),
+        evidence: [
+          { label: "path contains", detail: adminPathMatch },
+          { label: "auth guard detected", detail: `${handler.method} handler` },
+          { label: "no admin/staff/role/permission check detected", detail: `${handler.method} handler` }
+        ],
+        context: handler.evidence
+      });
+    }
+
     if (handler.intent === "public-read") {
       if (includeLowConfidence) {
         addIssue({
@@ -1080,7 +1132,7 @@ function addApiRouteProtectionIssues({
     }
 
     if (handler.intent === "public-form") {
-      if (!handler.hasRateLimit && !handler.hasValidation) {
+      if (!(handler.hasValidation && handler.hasRateLimit)) {
         addIssue({
           ruleId: "public-form-missing-abuse-protection",
           category: "api",
@@ -1217,7 +1269,7 @@ function analyzeApiHandler({
 }): ApiHandlerAnalysis {
   const normalizedFile = relativeFile.toLowerCase();
   const webhookPathMatch = getRoutePathMatch(normalizedFile, ["webhook", "webhooks", "callback"]);
-  const internalPathMatch = getRoutePathMatch(normalizedFile, ["internal", "admin", "cron", "cleanup", "revalidate", "private"]);
+  const internalPathMatch = getRoutePathMatch(normalizedFile, ["internal", "admin", "cron", "cleanup", "revalidate", "private", "debug", "staff", "manager"]);
   const formPathMatch = getRoutePathMatch(normalizedFile, ["contact", "subscribe", "newsletter", "lead", "inquiry"]);
   const sensitivePathMatch = getRoutePathMatch(normalizedFile, [
     "upload",
@@ -1262,13 +1314,20 @@ function analyzeApiHandler({
     protectionAnalysis.sensitiveOperation
   );
   const hasAuth = protectionAnalysis.hasAccessControlGuard || hasStrongProtection;
-  const hasSecretProtection = hasSecretProtectionGuardBeforeSensitiveWork(
+  const secretProtectionAnalysis = analyzeSecretProtectionGuardBeforeSensitiveWork(
     handlerContent,
+    content,
     protectionAnalysis.sensitiveOperation
   );
+  const hasSecretProtection = secretProtectionAnalysis.hasSecretProtectionGuard;
   const hasWeakSecretSignal = hasWeakSecretProtectionSignal(handlerContent);
+  const adminAuthorizationAnalysis = analyzeAdminAuthorization(handlerContent);
+  const hasAdminAuthorization = adminAuthorizationAnalysis.hasAdminAuthorization;
   const hasRateLimit = hasRateLimitSignal(handlerContent);
-  const hasValidation = hasValidationSignal(handlerContent);
+  const hasBasicValidation = hasBasicValidationSignal(handlerContent);
+  const hasSchemaValidation = hasSchemaValidationSignal(handlerContent);
+  const hasValidation = hasBasicValidation || hasSchemaValidation;
+  const hasSpamProtection = hasSpamProtectionSignal(handlerContent);
   const hasCacheHeaders = hasCacheHeaderSignal(handlerContent);
   const hasMethodBlocking = hasMethodBlockingSignal(handlerContent);
   const hasWebhookVerification = hasWebhookSignatureVerification(handlerContent, webhookProvider);
@@ -1290,7 +1349,7 @@ function analyzeApiHandler({
     evidence.push({ label: "path contains", detail: internalPathMatch });
   } else if (method === "POST" && formPathMatch) {
     intent = "public-form";
-    evidence.push({ label: "path contains", detail: formPathMatch });
+    evidence.push({ label: "public submission endpoint detected", detail: formPathMatch });
   } else if (
     method === "GET" &&
     publicContentPathMatch &&
@@ -1306,12 +1365,24 @@ function analyzeApiHandler({
 
   if (protectionAnalysis.sensitiveOperation) {
     evidence.push({
-      label: `sensitive operation ${protectionAnalysis.sensitiveOperation.label} detected`,
+      label: intent === "public-form"
+        ? `${getPublicFormSideEffectLabel(protectionAnalysis.sensitiveOperation.label)} side effect detected`
+        : `sensitive side effect ${protectionAnalysis.sensitiveOperation.label} detected`,
       detail: `${method} handler`
     });
   }
 
-  if (protectionAnalysis.hasAccessControlGuard) {
+  if (protectionAnalysis.inputParsingOperation && intent !== "public-form") {
+    evidence.push({
+      label: `input parsing ${protectionAnalysis.inputParsingOperation.label} detected`,
+      detail: `${method} handler`
+    });
+  }
+
+  if (intent === "public-form") {
+    // Public forms usually do not require user auth. Keep evidence focused on
+    // validation, rate limiting, and spam protection instead.
+  } else if (protectionAnalysis.hasAccessControlGuard) {
     evidence.push(...protectionAnalysis.evidence);
   } else if (hasStrongProtection) {
     evidence.push({
@@ -1324,15 +1395,19 @@ function analyzeApiHandler({
       detail: `${method} handler`
     });
   } else if (protectionAnalysis.sensitiveOperation) {
-    evidence.push({ label: `no access-control guard detected before sensitive operation`, detail: `${method} handler` });
+    evidence.push({ label: `no access-control guard detected before sensitive side effect`, detail: `${method} handler` });
   } else {
     evidence.push({ label: `no auth/session check detected in ${method} handler` });
   }
 
   if (hasSecretProtection) {
-    evidence.push({ label: `secret-token guard detected before sensitive work`, detail: `${method} handler` });
+    evidence.push(...secretProtectionAnalysis.evidence);
   } else if (hasWeakSecretSignal) {
     evidence.push({ label: `possible secret/token signal detected`, detail: `${method} handler` });
+  }
+
+  if (hasAdminAuthorization) {
+    evidence.push(...adminAuthorizationAnalysis.evidence);
   }
 
   if (intent === "public-form") {
@@ -1340,8 +1415,20 @@ function analyzeApiHandler({
       label: hasRateLimit ? "rate limit detected" : "no rate limit detected",
       detail: `${method} handler`
     });
+
     evidence.push({
-      label: hasValidation ? "validation detected" : "no validation detected",
+      label: hasSchemaValidation
+        ? "schema validation detected"
+        : hasBasicValidation
+          ? "basic validation detected"
+          : "no validation detected",
+      detail: `${method} handler`
+    });
+
+    evidence.push({
+      label: hasSpamProtection
+        ? "spam/bot protection detected"
+        : "no spam/bot protection detected",
       detail: `${method} handler`
     });
   }
@@ -1381,12 +1468,24 @@ function analyzeApiHandler({
     evidence,
     hasAuth,
     hasSecretProtection,
+    hasAdminAuthorization,
     hasRateLimit,
+    hasBasicValidation,
+    hasSchemaValidation,
     hasValidation,
+    hasSpamProtection,
     hasCacheHeaders,
     hasMethodBlocking,
     hasWebhookVerification
   };
+}
+
+function getPublicFormSideEffectLabel(sideEffectLabel: string) {
+  if (sideEffectLabel === "send") {
+    return "email/send";
+  }
+
+  return sideEffectLabel;
 }
 
 function getHandlerContext(
@@ -1522,6 +1621,10 @@ function getRoutePathMatch(normalizedFile: string, terms: string[]) {
   });
 }
 
+function getAdminRoutePathMatch(relativeFile: string) {
+  return getRoutePathMatch(relativeFile.toLowerCase(), ["admin", "debug", "private", "staff", "manager"]);
+}
+
 function getExportedHttpMethods(content: string): ApiRouteMethod[] {
   return getExportedRouteHandlers(content).map((handler) => handler.method);
 }
@@ -1540,16 +1643,38 @@ function getExportedRouteHandlers(content: string): Array<{
   const constExportPattern = /\bexport\s+const\s+(GET|POST|PUT|PATCH|DELETE)\s*=/g;
 
   for (const match of content.matchAll(functionExportPattern)) {
+    if (isCommentedMatch(content, match.index ?? 0)) {
+      continue;
+    }
+
     handlers.push(extractRouteHandlerBody(content, match.index ?? 0, match[1] as ApiRouteMethod, "function"));
   }
 
   for (const match of content.matchAll(constExportPattern)) {
+    if (isCommentedMatch(content, match.index ?? 0)) {
+      continue;
+    }
+
     handlers.push(extractRouteHandlerBody(content, match.index ?? 0, match[1] as ApiRouteMethod, "const"));
   }
 
   return handlers.sort((leftHandler, rightHandler) =>
     getMethodRank(leftHandler.method) - getMethodRank(rightHandler.method)
   );
+}
+
+function isCommentedMatch(content: string, matchIndex: number) {
+  const lineStart = content.lastIndexOf("\n", matchIndex) + 1;
+  const linePrefix = content.slice(lineStart, matchIndex).trim();
+
+  if (linePrefix.startsWith("//") || linePrefix.startsWith("*")) {
+    return true;
+  }
+
+  const previousBlockStart = content.lastIndexOf("/*", matchIndex);
+  const previousBlockEnd = content.lastIndexOf("*/", matchIndex);
+
+  return previousBlockStart !== -1 && previousBlockStart > previousBlockEnd;
 }
 
 // This lightweight extractor keeps Qodfy dependency-free for now. It can be
@@ -1743,11 +1868,19 @@ function analyzeHandlerProtection({
   fullFileContent: string;
 }): HandlerProtectionAnalysis {
   const imports = getImportInfos(fullFileContent);
+  const inputParsingOperation = getFirstInputParsingOperation(handlerBody);
   const sensitiveOperation = getFirstSensitiveOperation(handlerBody);
+  const localHelpers = getLocalHelperInfos(fullFileContent);
   const helperAssignments = getHelperAssignments(handlerBody);
 
   for (const assignment of helperAssignments) {
     if (isRawRequestAccessorHelper(assignment.helperName)) {
+      continue;
+    }
+
+    const localHelper = getLocalHelperInfo(localHelpers, assignment.helperName);
+
+    if (localHelper && !isLocalProtectionHelper(localHelper.body)) {
       continue;
     }
 
@@ -1785,9 +1918,14 @@ function analyzeHandlerProtection({
       evidence.push({ label: "helper imported from protection module", detail: importInfo.source });
     }
 
+    if (localHelper) {
+      evidence.push({ label: "local protection helper detected", detail: localHelper.name });
+    }
+
     return {
       hasAccessControlGuard: true,
       evidence,
+      inputParsingOperation,
       sensitiveOperation
     };
   }
@@ -1795,6 +1933,7 @@ function analyzeHandlerProtection({
   return {
     hasAccessControlGuard: false,
     evidence: [],
+    inputParsingOperation,
     sensitiveOperation
   };
 }
@@ -1882,6 +2021,148 @@ function isProtectionImportSource(source: string) {
   return protectionSourceTerms.some((term) => normalizedSource.includes(term));
 }
 
+function getLocalHelperInfos(content: string): LocalHelperInfo[] {
+  return [
+    ...getLocalFunctionDeclarationHelpers(content),
+    ...getLocalConstFunctionHelpers(content)
+  ];
+}
+
+function getLocalFunctionDeclarationHelpers(content: string): LocalHelperInfo[] {
+  const helpers: LocalHelperInfo[] = [];
+  const functionPattern = /\bfunction\s+([A-Za-z_$][\w$]*)\s*\(/g;
+
+  for (const match of content.matchAll(functionPattern)) {
+    const helperName = match[1];
+    const matchIndex = match.index ?? 0;
+
+    if (!helperName) {
+      continue;
+    }
+
+    const openParenIndex = content.indexOf("(", matchIndex);
+    const closeParenIndex = openParenIndex === -1
+      ? -1
+      : findMatchingParen(content, openParenIndex);
+    const openBraceIndex = closeParenIndex === -1
+      ? -1
+      : content.indexOf("{", closeParenIndex);
+
+    if (openBraceIndex === -1) {
+      continue;
+    }
+
+    const closeBraceIndex = findMatchingBrace(content, openBraceIndex);
+
+    if (closeBraceIndex === -1) {
+      continue;
+    }
+
+    helpers.push({
+      name: helperName,
+      body: content.slice(openBraceIndex, closeBraceIndex + 1)
+    });
+  }
+
+  return helpers;
+}
+
+function getLocalConstFunctionHelpers(content: string): LocalHelperInfo[] {
+  const helpers: LocalHelperInfo[] = [];
+  const constFunctionPattern = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)/g;
+
+  for (const match of content.matchAll(constFunctionPattern)) {
+    const helperName = match[1];
+    const matchIndex = match.index ?? 0;
+
+    if (!helperName) {
+      continue;
+    }
+
+    const equalsIndex = content.indexOf("=", matchIndex);
+
+    if (equalsIndex === -1) {
+      continue;
+    }
+
+    const arrowIndex = content.indexOf("=>", equalsIndex);
+    const functionIndex = content.indexOf("function", equalsIndex);
+    const bodyStartSearchIndex = arrowIndex !== -1 && (functionIndex === -1 || arrowIndex < functionIndex)
+      ? arrowIndex + 2
+      : functionIndex;
+
+    if (bodyStartSearchIndex === -1) {
+      continue;
+    }
+
+    let bodyStartIndex = bodyStartSearchIndex;
+
+    while (/\s/.test(content[bodyStartIndex] ?? "")) {
+      bodyStartIndex++;
+    }
+
+    if (content[bodyStartIndex] === "{") {
+      const closeBraceIndex = findMatchingBrace(content, bodyStartIndex);
+
+      if (closeBraceIndex !== -1) {
+        helpers.push({
+          name: helperName,
+          body: content.slice(bodyStartIndex, closeBraceIndex + 1)
+        });
+      }
+
+      continue;
+    }
+
+    const expressionEndIndex = findExpressionEnd(content, bodyStartIndex);
+
+    helpers.push({
+      name: helperName,
+      body: content.slice(bodyStartIndex, expressionEndIndex)
+    });
+  }
+
+  return helpers;
+}
+
+function findExpressionEnd(content: string, startIndex: number) {
+  const semicolonIndex = content.indexOf(";", startIndex);
+  const newlineIndex = content.indexOf("\n", startIndex);
+
+  return [semicolonIndex, newlineIndex]
+    .filter((candidateIndex) => candidateIndex !== -1)
+    .sort((leftIndex, rightIndex) => leftIndex - rightIndex)[0] ?? content.length;
+}
+
+function getLocalHelperInfo(localHelpers: LocalHelperInfo[], helperName: string) {
+  const helperRootName = getHelperRootName(helperName);
+
+  return localHelpers.find((helper) => helper.name === helperRootName);
+}
+
+function getHelperRootName(helperName: string) {
+  return helperName.split(".")[0] ?? helperName;
+}
+
+function isLocalProtectionHelper(helperBody: string) {
+  return (
+    isSecretValidationExpression(helperBody) ||
+    hasStrongAuthProviderSignal(helperBody) ||
+    analyzeAdminAuthorization(helperBody).hasAdminAuthorization
+  );
+}
+
+function hasStrongAuthProviderSignal(content: string) {
+  return (
+    /\bauth\s*\(/i.test(content) ||
+    /\bgetServerSession\s*\(/.test(content) ||
+    /\bgetSession\s*\(/.test(content) ||
+    /\bcurrentUser\s*\(/.test(content) ||
+    /\bgetUser\s*\(/.test(content) ||
+    /\bauth\.getUser\s*\(/i.test(content)
+  );
+}
+
 function getHelperAssignments(handlerBody: string) {
   const assignments: Array<{
     variableName: string;
@@ -1890,6 +2171,7 @@ function getHelperAssignments(handlerBody: string) {
     endIndex: number;
   }> = [];
   const assignmentPattern = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*\(/g;
+  const destructuredAssignmentPattern = /\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*\(/g;
 
   for (const match of handlerBody.matchAll(assignmentPattern)) {
     const variableName = match[1];
@@ -1908,7 +2190,50 @@ function getHelperAssignments(handlerBody: string) {
     });
   }
 
-  return assignments;
+  for (const match of handlerBody.matchAll(destructuredAssignmentPattern)) {
+    const destructuredContent = match[1];
+    const helperName = match[2];
+    const index = match.index ?? 0;
+
+    if (!destructuredContent || !helperName) {
+      continue;
+    }
+
+    for (const variableName of parseDestructuredBindingNames(destructuredContent)) {
+      assignments.push({
+        variableName,
+        helperName,
+        index,
+        endIndex: index + match[0].length
+      });
+    }
+  }
+
+  return assignments.sort((leftAssignment, rightAssignment) =>
+    leftAssignment.index - rightAssignment.index
+  );
+}
+
+function parseDestructuredBindingNames(destructuredContent: string) {
+  const variableNames: string[] = [];
+
+  for (const part of destructuredContent.split(",")) {
+    const trimmedPart = part.trim();
+
+    if (!trimmedPart) {
+      continue;
+    }
+
+    const withoutDefault = trimmedPart.split("=")[0]?.trim() ?? "";
+    const aliasParts = withoutDefault.split(":");
+    const variableName = (aliasParts[1] ?? aliasParts[0])?.trim();
+
+    if (variableName && /^[A-Za-z_$][\w$]*$/.test(variableName)) {
+      variableNames.push(variableName);
+    }
+  }
+
+  return variableNames;
 }
 
 function isRawRequestAccessorHelper(helperName: string) {
@@ -2050,20 +2375,43 @@ function getAccessDeniedReturnSignal(branchText: string) {
 }
 
 function getImportInfoForHelper(imports: ImportInfo[], helperName: string) {
-  const helperRootName = helperName.split(".")[0];
+  const helperRootName = getHelperRootName(helperName);
 
   return imports.find((importInfo) => importInfo.localName === helperRootName);
 }
 
+function getFirstInputParsingOperation(handlerBody: string): InputParsingSignal | undefined {
+  const inputParsingPatterns: Array<{ label: string; pattern: RegExp }> = [
+    { label: "request.json", pattern: /\brequest\.json\s*\(/i },
+    { label: "request.formData", pattern: /\brequest\.formData\s*\(/i },
+    { label: "request.text", pattern: /\brequest\.text\s*\(/i },
+    { label: "searchParams.get", pattern: /\b(?:request\.nextUrl\.)?searchParams\.get\s*\(/i }
+  ];
+  const matches: InputParsingSignal[] = [];
+
+  for (const inputParsingPattern of inputParsingPatterns) {
+    const match = inputParsingPattern.pattern.exec(handlerBody);
+
+    if (match?.index !== undefined) {
+      matches.push({
+        label: inputParsingPattern.label,
+        index: match.index
+      });
+    }
+  }
+
+  return matches.sort((leftMatch, rightMatch) => leftMatch.index - rightMatch.index)[0];
+}
+
 function getFirstSensitiveOperation(handlerBody: string): SensitiveOperationSignal | undefined {
   const sensitiveOperationPatterns: Array<{ label: string; pattern: RegExp }> = [
-    { label: "request.formData", pattern: /\brequest\.formData\s*\(/i },
-    { label: "request.json", pattern: /\brequest\.json\s*\(/i },
     { label: "file.arrayBuffer", pattern: /\b[A-Za-z_$][\w$]*\.arrayBuffer\s*\(/i },
     { label: "Buffer.from", pattern: /\bBuffer\.from\s*\(/ },
     { label: "uploadToR2", pattern: /\buploadToR2\s*\(/i },
     { label: "upload", pattern: /\bupload[A-Za-z0-9_$]*\s*\(/i },
     { label: "putObject", pattern: /\bputObject\s*\(/i },
+    { label: "revalidatePath", pattern: /\brevalidatePath\s*\(/i },
+    { label: "revalidateTag", pattern: /\brevalidateTag\s*\(/i },
     { label: "storage", pattern: /\bstorage\b/i },
     { label: "write", pattern: /\bwrite[A-Za-z0-9_$]*\s*\(/i },
     { label: "create", pattern: /\bcreate[A-Za-z0-9_$]*\s*\(/i },
@@ -2085,6 +2433,13 @@ function getFirstSensitiveOperation(handlerBody: string): SensitiveOperationSign
     const match = sensitiveOperationPattern.pattern.exec(handlerBody);
 
     if (match?.index !== undefined) {
+      if (
+        isBroadMutationOperationLabel(sensitiveOperationPattern.label) &&
+        isBenignHelperFunctionCall(match[0] ?? "")
+      ) {
+        continue;
+      }
+
       matches.push({
         label: sensitiveOperationPattern.label,
         index: match.index
@@ -2093,6 +2448,26 @@ function getFirstSensitiveOperation(handlerBody: string): SensitiveOperationSign
   }
 
   return matches.sort((leftMatch, rightMatch) => leftMatch.index - rightMatch.index)[0];
+}
+
+function isBroadMutationOperationLabel(label: string) {
+  return ["create", "update", "delete", "insert", "write"].includes(label);
+}
+
+function isBenignHelperFunctionCall(callExpression: string) {
+  const functionName = callExpression.match(/\b([A-Za-z_$][\w$]*)\s*\(/)?.[1];
+
+  if (!functionName) {
+    return false;
+  }
+
+  const normalizedFunctionName = functionName.toLowerCase();
+
+  return (
+    normalizedFunctionName.includes("ratelimit") ||
+    normalizedFunctionName.includes("header") ||
+    normalizedFunctionName.includes("response")
+  );
 }
 
 function escapeRegExp(value: string) {
@@ -2206,46 +2581,171 @@ function hasWeakSecretProtectionSignal(content: string) {
   );
 }
 
-function hasSecretProtectionGuardBeforeSensitiveWork(
+function analyzeSecretProtectionGuardBeforeSensitiveWork(
   handlerBody: string,
+  fullFileContent: string,
   sensitiveOperation?: SensitiveOperationSignal
-) {
+): SecretProtectionAnalysis {
   const protectionCutoffIndex = sensitiveOperation?.index ?? Math.min(2000, handlerBody.length);
   const ifStatements = getIfStatements(handlerBody, 0, protectionCutoffIndex);
+  const localSecretHelpers = getLocalHelperInfos(fullFileContent).filter((helper) =>
+    isSecretValidationExpression(helper.body)
+  );
 
   for (const ifStatement of ifStatements) {
-    if (!isSecretTokenGuardCondition(ifStatement.condition)) {
+    const branch = getIfFailureBranch(handlerBody, ifStatement.branchStartIndex);
+    const returnSignal = getAccessDeniedReturnSignal(branch.text);
+
+    if (!returnSignal) {
       continue;
     }
 
-    const branch = getIfFailureBranch(handlerBody, ifStatement.branchStartIndex);
+    if (isSecretTokenGuardCondition(ifStatement.condition)) {
+      const evidence: IssueEvidence[] = [
+        { label: "secret-token guard detected before sensitive work" },
+        { label: "secret/token comparison detected", detail: "handler guard condition" },
+        { label: returnSignal }
+      ];
 
-    if (getAccessDeniedReturnSignal(branch.text)) {
+      if (sensitiveOperation) {
+        evidence.push({
+          label: `secret guard appears before sensitive side effect`,
+          detail: sensitiveOperation.label
+        });
+      }
+
+      return {
+        hasSecretProtectionGuard: true,
+        evidence
+      };
+    }
+
+    const localHelper = getLocalSecretHelperCalledInGuard(ifStatement.condition, localSecretHelpers);
+
+    if (localHelper) {
+      const evidence: IssueEvidence[] = [
+        { label: "secret-token guard detected before sensitive work" },
+        { label: "local secret validation helper detected", detail: localHelper.name },
+        { label: returnSignal }
+      ];
+
+      if (sensitiveOperation) {
+        evidence.push({
+          label: `secret guard appears before sensitive side effect`,
+          detail: sensitiveOperation.label
+        });
+      }
+
+      return {
+        hasSecretProtectionGuard: true,
+        evidence
+      };
+    }
+  }
+
+  return {
+    hasSecretProtectionGuard: false,
+    evidence: []
+  };
+}
+
+function isSecretTokenGuardCondition(condition: string) {
+  return isSecretValidationExpression(condition);
+}
+
+function isSecretValidationExpression(expression: string) {
+  const normalizedExpression = expression.toLowerCase();
+  const hasSecretInput =
+    /\b(?:token|secret|authorization|bearer)\b/i.test(expression) ||
+    /\bheaders\.get\s*\(\s*["'][^"']*(?:authorization|secret|token|key)[^"']*["']\s*\)/i.test(expression) ||
+    /\bsearchParams\.get\s*\(\s*["'](?:secret|token|key)["']\s*\)/i.test(expression) ||
+    /\bcookies?(?:\(\))?\.get\s*\(\s*["'][^"']*(?:secret|token|key|session)[^"']*["']\s*\)/i.test(expression);
+  const hasExpectedSecret =
+    /\bprocess\.env\.[A-Za-z0-9_]*(?:SECRET|TOKEN|KEY)\b/.test(expression) ||
+    /\bprocess\.env\[['"`][A-Za-z0-9_]*(?:SECRET|TOKEN|KEY)['"`]\]/.test(expression) ||
+    /\b(?:expected|valid|required|cron|revalidate|internal)[A-Za-z0-9_]*(?:Secret|Token|Key)\b/.test(expression) ||
+    /\b(?:expected|valid|required|cron|revalidate|internal)[a-z0-9_]*(?:secret|token|key)\b/.test(normalizedExpression);
+  const hasSecretValidationCall =
+    /\b(?:isValid|verify|validate|compare)[A-Za-z0-9_]*(?:Secret|Token|Key)?\s*\(/.test(expression) ||
+    /\btimingSafeEqual\s*\(/.test(expression);
+  const hasComparison =
+    /!==|!=|===|==/.test(expression) ||
+    /\b(?:timingSafeEqual|compare|verify|isValid|validate)[A-Za-z0-9_]*\s*\(/.test(expression);
+
+  return hasSecretInput && (hasExpectedSecret || hasSecretValidationCall) && hasComparison;
+}
+
+function getLocalSecretHelperCalledInGuard(
+  condition: string,
+  localSecretHelpers: LocalHelperInfo[]
+) {
+  return localSecretHelpers.find((helper) => {
+    const escapedHelperName = escapeRegExp(helper.name);
+
+    return (
+      new RegExp(`!\\s*(?:await\\s+)?${escapedHelperName}\\s*\\(`).test(condition) ||
+      new RegExp(`\\b${escapedHelperName}\\s*\\([^)]*\\)\\s*(?:={2,3})\\s*false\\b`).test(condition) ||
+      new RegExp(`\\bfalse\\s*(?:={2,3})\\s*${escapedHelperName}\\s*\\(`).test(condition) ||
+      new RegExp(`\\b${escapedHelperName}\\s*\\([^)]*\\)\\s*!={1,2}\\s*true\\b`).test(condition)
+    );
+  });
+}
+
+function analyzeAdminAuthorization(content: string): AdminAuthorizationAnalysis {
+  const evidence: IssueEvidence[] = [];
+
+  if (/\brequireAdmin\s*\(/.test(content)) {
+    evidence.push({ label: "admin authorization check detected", detail: "requireAdmin" });
+  }
+
+  if (/\brequireStaff\s*\(/.test(content)) {
+    evidence.push({ label: "staff authorization check detected", detail: "requireStaff" });
+  }
+
+  if (/\brequireRole\s*\(/.test(content) || /\brequirePermission\s*\(/.test(content)) {
+    evidence.push({ label: "role/permission check detected", detail: "requireRole/requirePermission" });
+  }
+
+  if (/\b(?:hasPermission|checkPermission)\s*\(/.test(content)) {
+    evidence.push({ label: "permission check detected", detail: "hasPermission/checkPermission" });
+  }
+
+  if (/\b(?:isAdmin|isStaff)\b/.test(content)) {
+    evidence.push({ label: "admin/staff flag detected", detail: "isAdmin/isStaff" });
+  }
+
+  if (/\brole\s*(?:={2,3}|!={1,2})\s*["'](?:ADMIN|admin|STAFF|staff|MANAGER|manager)["']/.test(content)) {
+    evidence.push({ label: "role comparison detected" });
+  }
+
+  if (/\b(?:allowedRoles|roles)\.includes\s*\(/.test(content) || /\.includes\s*\(\s*(?:user|staff|session|account)\.role\s*\)/.test(content)) {
+    evidence.push({ label: "allowed roles check detected" });
+  }
+
+  if (hasRoleGuardReturningForbidden(content)) {
+    evidence.push({ label: "role guard returns 403/Forbidden" });
+  }
+
+  return {
+    hasAdminAuthorization: evidence.length > 0,
+    evidence
+  };
+}
+
+function hasRoleGuardReturningForbidden(content: string) {
+  for (const ifStatement of getIfStatements(content)) {
+    if (!/\b(?:role|permission|admin|staff|manager|allowedRoles|isAdmin|isStaff)\b/i.test(ifStatement.condition)) {
+      continue;
+    }
+
+    const branch = getIfFailureBranch(content, ifStatement.branchStartIndex);
+
+    if (/\bstatus\s*:\s*403\b|\b403\b|Forbidden/i.test(branch.text)) {
       return true;
     }
   }
 
   return false;
-}
-
-function isSecretTokenGuardCondition(condition: string) {
-  const normalizedCondition = condition.toLowerCase();
-  const hasSecretInput =
-    /\b(?:token|secret|authorization|bearer)\b/i.test(condition) ||
-    /\bheaders\.get\s*\(\s*["'][^"']*(?:authorization|secret|token|key)[^"']*["']\s*\)/i.test(condition) ||
-    /\bsearchParams\.get\s*\(\s*["'](?:secret|token|key)["']\s*\)/i.test(condition);
-  const hasExpectedSecret =
-    /\bprocess\.env\.[A-Za-z0-9_]*(?:SECRET|TOKEN|KEY)\b/.test(condition) ||
-    /\b(?:expected|valid|required|cron|revalidate)[A-Za-z0-9_]*(?:Secret|Token|Key)\b/.test(condition) ||
-    /\b(?:expected|valid|required|cron|revalidate)[a-z0-9_]*(?:secret|token|key)\b/.test(normalizedCondition);
-  const hasSecretValidationCall =
-    /\b(?:isValid|verify|validate|compare)[A-Za-z0-9_]*(?:Secret|Token|Key)?\s*\(/.test(condition) ||
-    /\btimingSafeEqual\s*\(/.test(condition);
-  const hasComparison =
-    /!==|!=|===|==/.test(condition) ||
-    /\b(?:timingSafeEqual|compare|verify|isValid|validate)[A-Za-z0-9_]*\s*\(/.test(condition);
-
-  return hasSecretInput && (hasExpectedSecret || hasSecretValidationCall) && hasComparison;
 }
 
 function hasRateLimitSignal(content: string) {
@@ -2256,27 +2756,60 @@ function hasRateLimitSignal(content: string) {
     normalizedContent.includes("rate limit") ||
     normalizedContent.includes("limiter") ||
     normalizedContent.includes("upstash") ||
-    normalizedContent.includes("throttle")
+    normalizedContent.includes("throttle") ||
+    normalizedContent.includes("too many requests") ||
+    /\bstatus\s*:\s*429\b/.test(normalizedContent) ||
+    /\b429\b/.test(normalizedContent)
   );
 }
 
 function hasValidationSignal(content: string) {
+  return hasBasicValidationSignal(content) || hasSchemaValidationSignal(content);
+}
+
+function hasBasicValidationSignal(content: string) {
   const normalizedContent = content.toLowerCase();
 
   return (
-    normalizedContent.includes("zod") ||
-    normalizedContent.includes("schema") ||
+    /\bif\s*\([^)]*!\s*(?:email|name|message|value|body|payload|input|content|phone|subject)\b/i.test(content) ||
+    /\btypeof\s+\w+\s*!==\s*["']string["']/.test(content) ||
+    /\btypeof\s+\w+\s*===\s*["']string["']/.test(content) ||
+    /\.\s*trim\s*\(/.test(content) ||
+    /\.\s*length\b/.test(content) ||
     normalizedContent.includes("validate") ||
     normalizedContent.includes("validation") ||
     normalizedContent.includes("sanitize") ||
-    normalizedContent.includes("safeparse") ||
-    normalizedContent.includes("parse(") ||
     normalizedContent.includes("slugregex") ||
     normalizedContent.includes("isvalid") ||
+    (/\bstatus\s*:\s*400\b/.test(normalizedContent) &&
+      /\b(?:email|name|message|value|body|payload|input|content|phone|subject)\b/.test(normalizedContent))
+  );
+}
+
+function hasSchemaValidationSignal(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
+    normalizedContent.includes("safeparse") ||
+    /\bparse\s*\(\s*(?:body|payload|input|data|requestbody)\s*\)/i.test(content) ||
+    normalizedContent.includes("z.object") ||
+    normalizedContent.includes("yup") ||
+    normalizedContent.includes("joi") ||
+    normalizedContent.includes("valibot") ||
+    normalizedContent.includes("arktype")
+  );
+}
+
+function hasSpamProtectionSignal(content: string) {
+  const normalizedContent = content.toLowerCase();
+
+  return (
     normalizedContent.includes("captcha") ||
-    normalizedContent.includes("turnstile") ||
     normalizedContent.includes("recaptcha") ||
-    normalizedContent.includes("hcaptcha")
+    normalizedContent.includes("hcaptcha") ||
+    normalizedContent.includes("turnstile") ||
+    normalizedContent.includes("honeypot") ||
+    normalizedContent.includes("bot protection")
   );
 }
 
@@ -2752,6 +3285,30 @@ Return:
 - Whether protection already exists.
 - The safest minimal change if protection is missing.
 - Any edge cases I should test.`;
+}
+
+function createAdminAuthorizationFixPrompt(file: string, method: ApiRouteMethod) {
+  return `Review the API route at ${file}.
+
+Qodfy detected a possible authorization issue in the ${method} handler.
+
+Goal:
+Confirm this authenticated handler is restricted to the right admin, staff, role, or permission level.
+
+Instructions:
+- Inspect each exported HTTP handler separately.
+- Do not add a new auth provider.
+- Do not duplicate authentication if the handler already has a 401/403 guard.
+- Check the existing project pattern for admin, staff, role, or permission checks.
+- If this handler exposes admin, private, staff, manager, or debug functionality, confirm it has an authorization check beyond basic login.
+- If this route is only for debugging, remove it or make sure it cannot run in production.
+- Keep existing response formats unchanged.
+
+Return:
+- Where authentication currently happens.
+- Whether admin/staff/role/permission authorization exists.
+- The safest minimal change if authorization is missing.
+- Edge cases to test.`;
 }
 
 function createMissingEnvVariableFixPrompt(variableName: string, files: string[]) {

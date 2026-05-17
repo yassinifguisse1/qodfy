@@ -828,6 +828,10 @@ function getTopPriorities(issues: Issue[]) {
       message: "Protect internal or operational API routes before launch."
     },
     {
+      ruleIds: ["admin-route-missing-authorization"],
+      message: "Confirm admin/private routes have role or permission checks."
+    },
+    {
       ruleIds: ["public-form-missing-abuse-protection"],
       message: "Add abuse protection to public form routes."
     },
