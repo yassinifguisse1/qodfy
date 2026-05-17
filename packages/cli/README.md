@@ -24,14 +24,17 @@ Print machine-readable JSON:
 npx qodfy scan --json
 ```
 
-Write JSON or Markdown reports:
+Write JSON, Markdown, or HTML reports:
 
 ```bash
 npx qodfy scan --json --output qodfy-report.json
 npx qodfy scan --report qodfy-report.md
+npx qodfy scan --html qodfy-report.html
 ```
 
 The Markdown report is the **Qodfy Launch Report**: a senior-engineer-style review with a launch status, executive summary, top priorities, what looks good, and per-issue context (what Qodfy found, why it matters, evidence, suggested fix, and an AI fix prompt).
+
+The HTML report is a standalone, self-contained file (inline CSS, no external CDN, no JavaScript) that you can open directly in a browser to share with teammates or clients.
 
 ## What Qodfy Checks Today
 
@@ -85,6 +88,7 @@ qodfy scan --path <project-path>
 qodfy scan --json
 qodfy scan --json --output qodfy-report.json
 qodfy scan --report qodfy-report.md
+qodfy scan --html qodfy-report.html
 qodfy --help
 qodfy --version
 ```

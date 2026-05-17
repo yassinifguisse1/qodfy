@@ -176,6 +176,12 @@ Generate a Markdown report:
 pnpm --filter qodfy exec tsx src/index.ts scan --path ../../apps/web --report qodfy-report.md
 ```
 
+Generate a standalone HTML report:
+
+```bash
+pnpm --filter qodfy exec tsx src/index.ts scan --path ../../apps/web --html qodfy-report.html
+```
+
 Build all packages:
 
 ```bash
