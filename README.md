@@ -99,8 +99,8 @@ Fix critical issues first, then warnings, then cleanup items.
 | Rate limit warnings | ✅ | Warns when AI routes may be missing rate limiting |
 | Large file detection | ✅ | Finds files that may be hard to maintain |
 | Launch readiness score | ✅ | Generates a simple score from `0` to `100` |
-| Markdown reports | Planned | Export scan results as Markdown |
-| JSON reports | Planned | Export scan results for integrations |
+| Markdown reports | ✅ | Export scan results as human-readable Markdown |
+| JSON reports | ✅ | Export scan results for integrations |
 | GitHub Action | Planned | Scan pull requests automatically |
 | Dashboard | Future | Track scans, history, teams, and reports |
 
@@ -164,6 +164,18 @@ Run the CLI locally against the web app:
 pnpm dev:cli
 ```
 
+Generate machine-readable JSON:
+
+```bash
+pnpm --filter qodfy exec tsx src/index.ts scan --path ../../apps/web --json
+```
+
+Generate a Markdown report:
+
+```bash
+pnpm --filter qodfy exec tsx src/index.ts scan --path ../../apps/web --report qodfy-report.md
+```
+
 Build all packages:
 
 ```bash
@@ -223,8 +235,8 @@ The score is simple for now and will improve as Qodfy adds more rules.
 
 ### v0.2
 
-- [ ] Add Markdown report output
-- [ ] Add JSON report output
+- [x] Add Markdown report output
+- [x] Add JSON report output
 - [ ] Detect exposed environment variables
 - [ ] Detect Stripe webhook signature verification
 - [ ] Detect missing rate limits more accurately

@@ -18,9 +18,24 @@ Scan a specific folder:
 npx qodfy scan --path apps/web
 ```
 
+Print machine-readable JSON:
+
+```bash
+npx qodfy scan --json
+```
+
+Write JSON or Markdown reports:
+
+```bash
+npx qodfy scan --json --output qodfy-report.json
+npx qodfy scan --report qodfy-report.md
+```
+
+The Markdown report is the **Qodfy Launch Report**: a senior-engineer-style review with a launch status, executive summary, top priorities, what looks good, and per-issue context (what Qodfy found, why it matters, evidence, suggested fix, and an AI fix prompt).
+
 ## What Qodfy Checks Today
 
-Qodfy v0.1 scans locally and looks for common launch-readiness risks:
+Qodfy scans locally and looks for common launch-readiness risks:
 
 - Next.js project detection
 - missing `.env.example`
@@ -67,6 +82,9 @@ Fix critical issues first, then warnings, then cleanup items.
 ```bash
 qodfy scan
 qodfy scan --path <project-path>
+qodfy scan --json
+qodfy scan --json --output qodfy-report.json
+qodfy scan --report qodfy-report.md
 qodfy --help
 qodfy --version
 ```
@@ -79,13 +97,12 @@ Qodfy starts at `100`.
 - Warning: `-8`
 - Info: no major score penalty
 
-The score is intentionally simple in v0.1 and will become more precise as the rule set improves.
+The score is intentionally simple and will become more precise as the rule set improves.
 
 ## Roadmap
 
 Near-term priorities:
 
-- JSON and Markdown output
 - `.env.example` coverage for `process.env.*`
 - exposed secret detection
 - Stripe webhook signature checks
