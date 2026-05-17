@@ -45,7 +45,8 @@
   },
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts --clean --tsconfig tsconfig.json",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test": "node --import tsx --test src/protection.test.ts"
   },
   "dependencies": {
     "fast-glob": "^3.3.3"

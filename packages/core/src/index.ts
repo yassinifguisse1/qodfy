@@ -99,6 +99,24 @@ type WebhookRouteInfo = {
   confidence: "high" | "likely";
 };
 
+type ImportInfo = {
+  localName: string;
+  importedName: string;
+  source: string;
+  isProtectionSource: boolean;
+};
+
+type SensitiveOperationSignal = {
+  label: string;
+  index: number;
+};
+
+type HandlerProtectionAnalysis = {
+  hasAccessControlGuard: boolean;
+  evidence: IssueEvidence[];
+  sensitiveOperation?: SensitiveOperationSignal;
+};
+
 type ApiHandlerIntent =
   | "public-read"
   | "public-form"
@@ -1234,8 +1252,21 @@ function analyzeApiHandler({
   const handlerContent = body || content;
   const webhookRouteInfo = getWebhookRouteInfo(relativeFile, handlerContent);
   const webhookProvider = webhookRouteInfo?.provider ?? getWebhookProvider(`${normalizedFile}\n${handlerContent.toLowerCase()}`);
-  const hasAuth = hasAuthOrSessionCheck(handlerContent);
-  const hasSecretProtection = hasSecretProtectionSignal(handlerContent);
+  const protectionAnalysis = analyzeHandlerProtection({
+    handlerBody: handlerContent,
+    fullFileContent: content
+  });
+  const hasWeakAuthSignal = hasWeakAuthRelatedSignal(handlerContent);
+  const hasStrongProtection = hasStrongProtectionCallBeforeSensitiveWork(
+    handlerContent,
+    protectionAnalysis.sensitiveOperation
+  );
+  const hasAuth = protectionAnalysis.hasAccessControlGuard || hasStrongProtection;
+  const hasSecretProtection = hasSecretProtectionGuardBeforeSensitiveWork(
+    handlerContent,
+    protectionAnalysis.sensitiveOperation
+  );
+  const hasWeakSecretSignal = hasWeakSecretProtectionSignal(handlerContent);
   const hasRateLimit = hasRateLimitSignal(handlerContent);
   const hasValidation = hasValidationSignal(handlerContent);
   const hasCacheHeaders = hasCacheHeaderSignal(handlerContent);
@@ -1273,14 +1304,35 @@ function analyzeApiHandler({
     evidence.push({ label: "path contains", detail: sensitivePathMatch });
   }
 
-  if (hasAuth) {
-    evidence.push({ label: `auth/session check detected in ${method} handler` });
+  if (protectionAnalysis.sensitiveOperation) {
+    evidence.push({
+      label: `sensitive operation ${protectionAnalysis.sensitiveOperation.label} detected`,
+      detail: `${method} handler`
+    });
+  }
+
+  if (protectionAnalysis.hasAccessControlGuard) {
+    evidence.push(...protectionAnalysis.evidence);
+  } else if (hasStrongProtection) {
+    evidence.push({
+      label: "strong protection call detected before sensitive work",
+      detail: `${method} handler`
+    });
+  } else if (hasWeakAuthSignal) {
+    evidence.push({
+      label: "possible auth-related signal detected",
+      detail: `${method} handler`
+    });
+  } else if (protectionAnalysis.sensitiveOperation) {
+    evidence.push({ label: `no access-control guard detected before sensitive operation`, detail: `${method} handler` });
   } else {
     evidence.push({ label: `no auth/session check detected in ${method} handler` });
   }
 
   if (hasSecretProtection) {
-    evidence.push({ label: `secret token check detected in ${method} handler` });
+    evidence.push({ label: `secret-token guard detected before sensitive work`, detail: `${method} handler` });
+  } else if (hasWeakSecretSignal) {
+    evidence.push({ label: `possible secret/token signal detected`, detail: `${method} handler` });
   }
 
   if (intent === "public-form") {
@@ -1591,6 +1643,48 @@ function findMatchingParen(content: string, openParenIndex: number) {
   return -1;
 }
 
+function getIfStatements(
+  content: string,
+  startIndex = 0,
+  endIndex = content.length
+): Array<{ index: number; condition: string; branchStartIndex: number }> {
+  const statements: Array<{ index: number; condition: string; branchStartIndex: number }> = [];
+  const ifPattern = /\bif\s*\(/g;
+  ifPattern.lastIndex = startIndex;
+
+  let match: RegExpExecArray | null;
+
+  while ((match = ifPattern.exec(content)) !== null) {
+    const matchIndex = match.index;
+
+    if (matchIndex > endIndex) {
+      break;
+    }
+
+    const openParenIndex = content.indexOf("(", matchIndex);
+
+    if (openParenIndex === -1 || openParenIndex > endIndex) {
+      continue;
+    }
+
+    const closeParenIndex = findMatchingParen(content, openParenIndex);
+
+    if (closeParenIndex === -1 || closeParenIndex > endIndex) {
+      continue;
+    }
+
+    statements.push({
+      index: matchIndex,
+      condition: content.slice(openParenIndex + 1, closeParenIndex),
+      branchStartIndex: closeParenIndex + 1
+    });
+
+    ifPattern.lastIndex = closeParenIndex + 1;
+  }
+
+  return statements;
+}
+
 function findMatchingBrace(content: string, openBraceIndex: number) {
   let depth = 0;
 
@@ -1641,30 +1735,464 @@ function hasMutationMethod(methods: ApiRouteMethod[]) {
   return methods.some(isMutationMethod);
 }
 
-function hasAuthOrSessionCheck(content: string) {
-  const normalizedContent = content.toLowerCase();
+function analyzeHandlerProtection({
+  handlerBody,
+  fullFileContent
+}: {
+  handlerBody: string;
+  fullFileContent: string;
+}): HandlerProtectionAnalysis {
+  const imports = getImportInfos(fullFileContent);
+  const sensitiveOperation = getFirstSensitiveOperation(handlerBody);
+  const helperAssignments = getHelperAssignments(handlerBody);
+
+  for (const assignment of helperAssignments) {
+    if (isRawRequestAccessorHelper(assignment.helperName)) {
+      continue;
+    }
+
+    if (!isGuardHelperAssignmentNearTop(assignment.index, handlerBody, sensitiveOperation)) {
+      continue;
+    }
+
+    const guard = findAccessControlGuardForVariable({
+      handlerBody,
+      variableName: assignment.variableName,
+      startIndex: assignment.endIndex
+    });
+
+    if (!guard) {
+      continue;
+    }
+
+    if (sensitiveOperation && guard.endIndex > sensitiveOperation.index) {
+      continue;
+    }
+
+    const importInfo = getImportInfoForHelper(imports, assignment.helperName);
+    const evidence: IssueEvidence[] = [
+      { label: "access-control guard detected" },
+      { label: "helper call assigned to variable", detail: assignment.variableName },
+      { label: "guard checks variable", detail: assignment.variableName },
+      { label: guard.returnSignal }
+    ];
+
+    if (sensitiveOperation) {
+      evidence.push({ label: "guard appears before sensitive operation", detail: sensitiveOperation.label });
+    }
+
+    if (importInfo?.isProtectionSource) {
+      evidence.push({ label: "helper imported from protection module", detail: importInfo.source });
+    }
+
+    return {
+      hasAccessControlGuard: true,
+      evidence,
+      sensitiveOperation
+    };
+  }
+
+  return {
+    hasAccessControlGuard: false,
+    evidence: [],
+    sensitiveOperation
+  };
+}
+
+function getImportInfos(content: string): ImportInfo[] {
+  const imports: ImportInfo[] = [];
+  const importPattern = /import\s+(?:type\s+)?([\s\S]*?)\s+from\s+["']([^"']+)["'];?/g;
+
+  for (const match of content.matchAll(importPattern)) {
+    const importClause = match[1]?.trim();
+    const source = match[2];
+
+    if (!importClause || !source) {
+      continue;
+    }
+
+    const isProtectionSource = isProtectionImportSource(source);
+    const namedImportMatch = importClause.match(/\{([\s\S]*?)\}/);
+
+    if (namedImportMatch?.[1]) {
+      const namedImports = namedImportMatch[1].split(",");
+
+      for (const namedImport of namedImports) {
+        const parts = namedImport.trim().split(/\s+as\s+/i);
+        const importedName = parts[0]?.trim();
+        const localName = parts[1]?.trim() ?? importedName;
+
+        if (importedName && localName) {
+          imports.push({
+            localName,
+            importedName,
+            source,
+            isProtectionSource
+          });
+        }
+      }
+    }
+
+    const clauseBeforeNamedImports = importClause.split("{")[0]?.replace(/,\s*$/, "").trim();
+
+    if (clauseBeforeNamedImports && !clauseBeforeNamedImports.startsWith("*")) {
+      const defaultImport = clauseBeforeNamedImports.split(",")[0]?.trim();
+
+      if (defaultImport && /^[A-Za-z_$][\w$]*$/.test(defaultImport)) {
+        imports.push({
+          localName: defaultImport,
+          importedName: "default",
+          source,
+          isProtectionSource
+        });
+      }
+    }
+
+    const namespaceImportMatch = importClause.match(/\*\s+as\s+([A-Za-z_$][\w$]*)/);
+
+    if (namespaceImportMatch?.[1]) {
+      imports.push({
+        localName: namespaceImportMatch[1],
+        importedName: "*",
+        source,
+        isProtectionSource
+      });
+    }
+  }
+
+  return imports;
+}
+
+function isProtectionImportSource(source: string) {
+  const normalizedSource = source.toLowerCase();
+  const protectionSourceTerms = [
+    "auth",
+    "session",
+    "sessions",
+    "staff",
+    "permission",
+    "permissions",
+    "access",
+    "access-control",
+    "security",
+    "user",
+    "users"
+  ];
+
+  return protectionSourceTerms.some((term) => normalizedSource.includes(term));
+}
+
+function getHelperAssignments(handlerBody: string) {
+  const assignments: Array<{
+    variableName: string;
+    helperName: string;
+    index: number;
+    endIndex: number;
+  }> = [];
+  const assignmentPattern = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*\(/g;
+
+  for (const match of handlerBody.matchAll(assignmentPattern)) {
+    const variableName = match[1];
+    const helperName = match[2];
+    const index = match.index ?? 0;
+
+    if (!variableName || !helperName) {
+      continue;
+    }
+
+    assignments.push({
+      variableName,
+      helperName,
+      index,
+      endIndex: index + match[0].length
+    });
+  }
+
+  return assignments;
+}
+
+function isRawRequestAccessorHelper(helperName: string) {
+  const normalizedHelperName = helperName.toLowerCase();
+  const rawAccessorHelpers = [
+    "request.headers.get",
+    "req.headers.get",
+    "headers.get",
+    "request.cookies.get",
+    "req.cookies.get",
+    "request.nexturl.searchparams.get",
+    "req.nexturl.searchparams.get",
+    "searchparams.get",
+    "cookies"
+  ];
+
+  return rawAccessorHelpers.includes(normalizedHelperName);
+}
+
+function isGuardHelperAssignmentNearTop(
+  assignmentIndex: number,
+  handlerBody: string,
+  sensitiveOperation?: SensitiveOperationSignal
+) {
+  if (sensitiveOperation) {
+    return assignmentIndex < sensitiveOperation.index;
+  }
+
+  return assignmentIndex < Math.min(1500, handlerBody.length);
+}
+
+function findAccessControlGuardForVariable({
+  handlerBody,
+  variableName,
+  startIndex
+}: {
+  handlerBody: string;
+  variableName: string;
+  startIndex: number;
+}) {
+  const guardSearchEnd = Math.min(handlerBody.length, startIndex + 2500);
+  const ifStatements = getIfStatements(handlerBody, startIndex, guardSearchEnd);
+
+  for (const ifStatement of ifStatements) {
+    if (!doesConditionBlockWhenVariableMissing(ifStatement.condition, variableName)) {
+      continue;
+    }
+
+    const branch = getIfFailureBranch(handlerBody, ifStatement.branchStartIndex);
+    const returnSignal = getAccessDeniedReturnSignal(branch.text);
+
+    if (!returnSignal) {
+      continue;
+    }
+
+    return {
+      endIndex: branch.endIndex,
+      returnSignal
+    };
+  }
+
+  return null;
+}
+
+function doesConditionBlockWhenVariableMissing(condition: string, variableName: string) {
+  const escapedVariableName = escapeRegExp(variableName);
 
   return (
-    normalizedContent.includes("auth(") ||
-    normalizedContent.includes("getserversession") ||
-    normalizedContent.includes("currentuser") ||
-    normalizedContent.includes("clerkclient") ||
-    normalizedContent.includes("session") ||
-    normalizedContent.includes("requireauth") ||
-    normalizedContent.includes("requireuser") ||
-    normalizedContent.includes("requireadmin") ||
-    normalizedContent.includes("verifysession") ||
-    normalizedContent.includes("getuser") ||
-    normalizedContent.includes("jwt") ||
-    normalizedContent.includes("authorization") ||
-    normalizedContent.includes("bearer") ||
-    normalizedContent.includes("cookies()") ||
-    normalizedContent.includes("request.cookies") ||
-    normalizedContent.includes("middleware")
+    new RegExp(`!\\s*${escapedVariableName}(?:\\b|\\?\\.|\\.)`).test(condition) ||
+    new RegExp(`\\b${escapedVariableName}\\s*(?:={2,3})\\s*(?:null|undefined|false)\\b`).test(condition) ||
+    new RegExp(`\\b(?:null|undefined|false)\\s*(?:={2,3})\\s*${escapedVariableName}\\b`).test(condition) ||
+    new RegExp(`!\\s*${escapedVariableName}(?:\\?\\.)?\\.[A-Za-z_$][\\w$]*`).test(condition) ||
+    new RegExp(`\\b${escapedVariableName}(?:\\?\\.)?\\.[A-Za-z_$][\\w$]*\\s*(?:={2,3})\\s*false\\b`).test(condition) ||
+    new RegExp(`\\bfalse\\s*(?:={2,3})\\s*${escapedVariableName}(?:\\?\\.)?\\.[A-Za-z_$][\\w$]*\\b`).test(condition)
   );
 }
 
-function hasSecretProtectionSignal(content: string) {
+function getIfFailureBranch(handlerBody: string, branchStartIndex: number) {
+  let index = branchStartIndex;
+
+  while (/\s/.test(handlerBody[index] ?? "")) {
+    index++;
+  }
+
+  if (handlerBody[index] === "{") {
+    const closeBraceIndex = findMatchingBrace(handlerBody, index);
+
+    if (closeBraceIndex !== -1) {
+      return {
+        text: handlerBody.slice(index, closeBraceIndex + 1),
+        endIndex: closeBraceIndex
+      };
+    }
+  }
+
+  const semicolonIndex = handlerBody.indexOf(";", index);
+  const newlineIndex = handlerBody.indexOf("\n", index);
+  const branchEndIndex = [semicolonIndex, newlineIndex]
+    .filter((candidateIndex) => candidateIndex !== -1)
+    .sort((leftIndex, rightIndex) => leftIndex - rightIndex)[0] ?? Math.min(handlerBody.length, index + 300);
+
+  return {
+    text: handlerBody.slice(index, branchEndIndex + 1),
+    endIndex: branchEndIndex
+  };
+}
+
+function getAccessDeniedReturnSignal(branchText: string) {
+  const normalizedBranch = branchText.toLowerCase();
+
+  if (
+    !normalizedBranch.includes("return") &&
+    !normalizedBranch.includes("redirect(")
+  ) {
+    return null;
+  }
+
+  if (/\bstatus\s*:\s*401\b/.test(normalizedBranch) || /\b401\b/.test(normalizedBranch)) {
+    return "guard returns 401";
+  }
+
+  if (/\bstatus\s*:\s*403\b/.test(normalizedBranch) || /\b403\b/.test(normalizedBranch)) {
+    return "guard returns 403";
+  }
+
+  if (normalizedBranch.includes("unauthorized")) {
+    return "guard returns Unauthorized";
+  }
+
+  if (normalizedBranch.includes("forbidden")) {
+    return "guard returns Forbidden";
+  }
+
+  if (/redirect\s*\(\s*["']\/(?:login|sign-in|signin|auth)/.test(normalizedBranch)) {
+    return "guard redirects to login";
+  }
+
+  return null;
+}
+
+function getImportInfoForHelper(imports: ImportInfo[], helperName: string) {
+  const helperRootName = helperName.split(".")[0];
+
+  return imports.find((importInfo) => importInfo.localName === helperRootName);
+}
+
+function getFirstSensitiveOperation(handlerBody: string): SensitiveOperationSignal | undefined {
+  const sensitiveOperationPatterns: Array<{ label: string; pattern: RegExp }> = [
+    { label: "request.formData", pattern: /\brequest\.formData\s*\(/i },
+    { label: "request.json", pattern: /\brequest\.json\s*\(/i },
+    { label: "file.arrayBuffer", pattern: /\b[A-Za-z_$][\w$]*\.arrayBuffer\s*\(/i },
+    { label: "Buffer.from", pattern: /\bBuffer\.from\s*\(/ },
+    { label: "uploadToR2", pattern: /\buploadToR2\s*\(/i },
+    { label: "upload", pattern: /\bupload[A-Za-z0-9_$]*\s*\(/i },
+    { label: "putObject", pattern: /\bputObject\s*\(/i },
+    { label: "storage", pattern: /\bstorage\b/i },
+    { label: "write", pattern: /\bwrite[A-Za-z0-9_$]*\s*\(/i },
+    { label: "create", pattern: /\bcreate[A-Za-z0-9_$]*\s*\(/i },
+    { label: "update", pattern: /\bupdate[A-Za-z0-9_$]*\s*\(/i },
+    { label: "delete", pattern: /\bdelete[A-Za-z0-9_$]*\s*\(/i },
+    { label: "insert", pattern: /\binsert[A-Za-z0-9_$]*\s*\(/i },
+    { label: "cleanup", pattern: /\bcleanup[A-Za-z0-9_$]*\s*\(/i },
+    { label: "revalidate", pattern: /\brevalidate[A-Za-z0-9_$]*\s*\(/i },
+    { label: "prisma", pattern: /\bprisma\./i },
+    { label: "db", pattern: /\bdb\./i },
+    { label: "checkout", pattern: /\bcheckout\b/i },
+    { label: "payment", pattern: /\bpayment\b/i },
+    { label: "send", pattern: /\bsend[A-Za-z0-9_$]*\s*\(/i },
+    { label: "mutation", pattern: /\bmutation\b/i }
+  ];
+  const matches: SensitiveOperationSignal[] = [];
+
+  for (const sensitiveOperationPattern of sensitiveOperationPatterns) {
+    const match = sensitiveOperationPattern.pattern.exec(handlerBody);
+
+    if (match?.index !== undefined) {
+      matches.push({
+        label: sensitiveOperationPattern.label,
+        index: match.index
+      });
+    }
+  }
+
+  return matches.sort((leftMatch, rightMatch) => leftMatch.index - rightMatch.index)[0];
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasWeakAuthRelatedSignal(content: string) {
+  const normalizedContent = stripStrongProtectionIdentifiers(content).toLowerCase();
+  const weakSignals = [
+    "session",
+    "authorization",
+    "bearer",
+    "cookies()",
+    "request.cookies",
+    "middleware",
+    "getuser",
+    "jwt",
+    "auth(",
+    "getserversession",
+    "currentuser",
+    "clerkclient"
+  ];
+
+  return weakSignals.some((signal) => normalizedContent.includes(signal));
+}
+
+function stripStrongProtectionIdentifiers(content: string) {
+  return content
+    .replace(/\b(?:await\s+)?require(?:Auth|User|Admin)\s*\([^)]*\)/gi, "")
+    .replace(/\bauth\.protect\s*\([^)]*\)/gi, "")
+    .replace(/\b(?:await\s+)?verifySession\s*\([^)]*\)/gi, "");
+}
+
+function hasStrongProtectionCallBeforeSensitiveWork(
+  handlerBody: string,
+  sensitiveOperation?: SensitiveOperationSignal
+) {
+  const protectionCutoffIndex = sensitiveOperation?.index ?? Math.min(2000, handlerBody.length);
+  const strongProtectionPatterns = [
+    /\b(?:await\s+)?requireAuth\s*\(/gi,
+    /\b(?:await\s+)?requireUser\s*\(/gi,
+    /\b(?:await\s+)?requireAdmin\s*\(/gi,
+    /\bauth\.protect\s*\(/gi,
+    /(?:^|[;{\n]\s*)(?:await\s+)?verifySession\s*\(/gi
+  ];
+
+  for (const pattern of strongProtectionPatterns) {
+    pattern.lastIndex = 0;
+
+    for (const match of handlerBody.matchAll(pattern)) {
+      if ((match.index ?? Number.POSITIVE_INFINITY) < protectionCutoffIndex) {
+        return true;
+      }
+    }
+  }
+
+  return (
+    hasAuthGuardRedirectBeforeIndex(handlerBody, protectionCutoffIndex) ||
+    hasThrowBasedAuthGuardBeforeIndex(handlerBody, protectionCutoffIndex)
+  );
+}
+
+function hasAuthGuardRedirectBeforeIndex(handlerBody: string, cutoffIndex: number) {
+  const redirectPattern = /\bif\s*\(([\s\S]*?)\)\s*(?:return\s+)?redirect\s*\(\s*["']\/(?:login|sign-in|signin|auth)/gi;
+
+  for (const match of handlerBody.matchAll(redirectPattern)) {
+    const condition = match[1] ?? "";
+
+    if (
+      (match.index ?? Number.POSITIVE_INFINITY) < cutoffIndex &&
+      /\!/.test(condition)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasThrowBasedAuthGuardBeforeIndex(handlerBody: string, cutoffIndex: number) {
+  const throwGuardPattern =
+    /\bif\s*\(([\s\S]*?)\)\s*(?:throw\s+new\s+\w+|throw\s+[^;]*(?:Unauthorized|Forbidden|401|403))/gi;
+
+  for (const match of handlerBody.matchAll(throwGuardPattern)) {
+    const condition = match[1] ?? "";
+    const guardText = match[0] ?? "";
+
+    if (
+      (match.index ?? Number.POSITIVE_INFINITY) < cutoffIndex &&
+      /\!/.test(condition) &&
+      /Unauthorized|Forbidden|401|403/i.test(guardText)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasWeakSecretProtectionSignal(content: string) {
   const normalizedContent = content.toLowerCase();
 
   return (
@@ -1676,6 +2204,48 @@ function hasSecretProtectionSignal(content: string) {
     normalizedContent.includes("bearer") ||
     normalizedContent.includes("token")
   );
+}
+
+function hasSecretProtectionGuardBeforeSensitiveWork(
+  handlerBody: string,
+  sensitiveOperation?: SensitiveOperationSignal
+) {
+  const protectionCutoffIndex = sensitiveOperation?.index ?? Math.min(2000, handlerBody.length);
+  const ifStatements = getIfStatements(handlerBody, 0, protectionCutoffIndex);
+
+  for (const ifStatement of ifStatements) {
+    if (!isSecretTokenGuardCondition(ifStatement.condition)) {
+      continue;
+    }
+
+    const branch = getIfFailureBranch(handlerBody, ifStatement.branchStartIndex);
+
+    if (getAccessDeniedReturnSignal(branch.text)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isSecretTokenGuardCondition(condition: string) {
+  const normalizedCondition = condition.toLowerCase();
+  const hasSecretInput =
+    /\b(?:token|secret|authorization|bearer)\b/i.test(condition) ||
+    /\bheaders\.get\s*\(\s*["'][^"']*(?:authorization|secret|token|key)[^"']*["']\s*\)/i.test(condition) ||
+    /\bsearchParams\.get\s*\(\s*["'](?:secret|token|key)["']\s*\)/i.test(condition);
+  const hasExpectedSecret =
+    /\bprocess\.env\.[A-Za-z0-9_]*(?:SECRET|TOKEN|KEY)\b/.test(condition) ||
+    /\b(?:expected|valid|required|cron|revalidate)[A-Za-z0-9_]*(?:Secret|Token|Key)\b/.test(condition) ||
+    /\b(?:expected|valid|required|cron|revalidate)[a-z0-9_]*(?:secret|token|key)\b/.test(normalizedCondition);
+  const hasSecretValidationCall =
+    /\b(?:isValid|verify|validate|compare)[A-Za-z0-9_]*(?:Secret|Token|Key)?\s*\(/.test(condition) ||
+    /\btimingSafeEqual\s*\(/.test(condition);
+  const hasComparison =
+    /!==|!=|===|==/.test(condition) ||
+    /\b(?:timingSafeEqual|compare|verify|isValid|validate)[A-Za-z0-9_]*\s*\(/.test(condition);
+
+  return hasSecretInput && (hasExpectedSecret || hasSecretValidationCall) && hasComparison;
 }
 
 function hasRateLimitSignal(content: string) {
@@ -2055,7 +2625,8 @@ Determine whether the ${method} handler should be protected.
 Instructions:
 - Inspect each exported HTTP handler separately.
 - Do not add authentication to a GET handler if it is intentionally public.
-- If the ${method} handler handles file uploads, private data, storage writes, payments, account changes, or user-specific actions, add the existing project auth/session check to the ${method} handler.
+- If the ${method} handler already has a guard that returns 401/403 before sensitive logic, explain where it happens and do not add duplicate auth.
+- If the ${method} handler handles file uploads, private data, storage writes, payments, account changes, or user-specific actions, add the existing project auth/session check before sensitive logic.
 - Also verify protections such as input validation, file size limits for uploads, storage path safety, and rate limiting where relevant.
 - Do not introduce a new auth provider.
 - Do not refactor unrelated code.
