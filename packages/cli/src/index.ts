@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { checkbox, select } from "@inquirer/prompts";
@@ -39,6 +40,8 @@ type ScanCommandOptions = {
   output?: string;
   report?: string;
   html?: string;
+  open?: boolean;
+  preview?: boolean;
 };
 
 type PromptCommandOptions = {
@@ -84,6 +87,8 @@ program
   .option("--output <file>", "Write the JSON report to a file")
   .option("--report <file>", "Write a human-readable Markdown report to a file")
   .option("--html <file>", "Write a standalone HTML report to a file")
+  .option("--open", "Open the generated HTML report in the default browser")
+  .option("--preview", "Generate an HTML report at .qodfy/qodfy-report.html and open it in the browser")
   .action(async (options: ScanCommandOptions) => {
     const outputOptionsResult = validateScanOutputOptions(options);
 
@@ -146,9 +151,39 @@ program
         return;
       }
 
+      if (options.preview) {
+        const previewRelativePath = path.join(".qodfy", "qodfy-report.html");
+        const previewAbsolutePath = path.join(pathResult.projectPath, previewRelativePath);
+
+        await writeReportFile(previewAbsolutePath, renderHtmlReport(outputReport));
+        console.log(`Qodfy preview report saved to ${previewRelativePath}`);
+        console.log("Opening report in your browser...");
+
+        const opened = await openInBrowser(previewAbsolutePath);
+
+        if (!opened) {
+          printOpenFailureFallback(previewAbsolutePath);
+        }
+
+        return;
+      }
+
       if (options.html) {
-        await writeReportFile(options.html, renderHtmlReport(outputReport));
+        const resolvedHtmlPath = path.resolve(options.html);
+
+        await writeReportFile(resolvedHtmlPath, renderHtmlReport(outputReport));
         console.log(`Qodfy HTML report saved to ${options.html}`);
+
+        if (options.open) {
+          console.log("Opening report in your browser...");
+
+          const opened = await openInBrowser(resolvedHtmlPath);
+
+          if (!opened) {
+            printOpenFailureFallback(resolvedHtmlPath);
+          }
+        }
+
         return;
       }
 
@@ -281,10 +316,45 @@ function validateScanOutputOptions(options: ScanCommandOptions): { ok: true } | 
     };
   }
 
-  if ((options.json || options.report || options.html) && options.prompt) {
+  if (options.preview && options.json) {
     return {
       ok: false,
-      reason: "Use qodfy prompt <issue-id> for fix prompts, or run qodfy scan --json/--report/--html for reports."
+      reason: "Use either --preview or --json for one scan command, not both."
+    };
+  }
+
+  if (options.preview && options.report) {
+    return {
+      ok: false,
+      reason: "Use either --preview or --report for one scan command, not both."
+    };
+  }
+
+  if (options.preview && options.html) {
+    return {
+      ok: false,
+      reason: "Use either --preview or --html. --preview already creates an HTML report at .qodfy/qodfy-report.html."
+    };
+  }
+
+  if (options.preview && options.output) {
+    return {
+      ok: false,
+      reason: "--output is only used with --json. --preview already writes to .qodfy/qodfy-report.html."
+    };
+  }
+
+  if (options.open && !options.html && !options.preview) {
+    return {
+      ok: false,
+      reason: "--open can only be used with --html <file> or --preview."
+    };
+  }
+
+  if ((options.json || options.report || options.html || options.preview) && options.prompt) {
+    return {
+      ok: false,
+      reason: "Use qodfy prompt <issue-id> for fix prompts, or run qodfy scan --json/--report/--html/--preview for reports."
     };
   }
 
@@ -292,7 +362,7 @@ function validateScanOutputOptions(options: ScanCommandOptions): { ok: true } | 
 }
 
 function isOutputMode(options: ScanCommandOptions) {
-  return Boolean(options.json || options.output || options.report || options.html);
+  return Boolean(options.json || options.output || options.report || options.html || options.preview);
 }
 
 async function resolveScanMode(options: ScanCommandOptions): Promise<ScanModeResult> {
@@ -651,6 +721,63 @@ async function writeReportFile(outputPath: string, content: string) {
   await fs.writeFile(resolvedOutputPath, content, "utf8");
 }
 
+function getOpenCommand(filePath: string): { command: string; args: string[] } {
+  if (process.platform === "darwin") {
+    return { command: "open", args: [filePath] };
+  }
+
+  if (process.platform === "win32") {
+    // cmd.exe needs an empty title argument for `start` so that a quoted path
+    // is treated as the file to open rather than as the window title.
+    return { command: "cmd.exe", args: ["/c", "start", "", filePath] };
+  }
+
+  return { command: "xdg-open", args: [filePath] };
+}
+
+async function openInBrowser(filePath: string): Promise<boolean> {
+  const { command, args } = getOpenCommand(filePath);
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+
+    const finish = (value: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+
+    try {
+      // Use spawn with an explicit argument array and shell: false to avoid
+      // shell interpretation. This keeps file paths with spaces or special
+      // characters from being treated as additional shell tokens.
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: "ignore",
+        shell: false,
+        windowsHide: true
+      });
+
+      child.once("error", () => finish(false));
+      child.once("spawn", () => {
+        child.unref();
+        finish(true);
+      });
+
+      // Belt-and-braces: if neither event fires for some reason, give up.
+      setTimeout(() => finish(false), 2000).unref();
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+function printOpenFailureFallback(absolutePath: string) {
+  console.log("Qodfy could not open the report automatically.");
+  console.log(`Open it manually: ${absolutePath}`);
+}
+
 function renderMarkdownReport(report: OutputScanReport) {
   const projectName = path.basename(report.projectPath) || report.projectPath;
   const statusLabel = getStatusLabel(report.score);
@@ -765,13 +892,227 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+type IssueCounts = {
+  critical: number;
+  warning: number;
+  info: number;
+  total: number;
+};
+
+function getIssueCounts(report: OutputScanReport): IssueCounts {
+  return {
+    critical: countIssuesBySeverity(report.issues, "critical"),
+    warning: countIssuesBySeverity(report.issues, "warning"),
+    info: countIssuesBySeverity(report.issues, "info"),
+    total: report.issues.length
+  };
+}
+
+function hasIssuesByCategory(report: OutputScanReport, ...categories: IssueCategory[]): boolean {
+  if (categories.length === 0) {
+    return false;
+  }
+
+  const categorySet = new Set<IssueCategory>(categories);
+
+  return report.issues.some((issue) => categorySet.has(issue.category));
+}
+
+function hasIssueByRuleId(report: OutputScanReport, ruleId: string): boolean {
+  return report.issues.some((issue) => issue.ruleId === ruleId);
+}
+
+function getScoreDescription(score: number): string {
+  if (score >= 90) {
+    return "Your app looks close to launch-ready. Review any remaining notes before going live.";
+  }
+
+  if (score >= 75) {
+    return "Your app is close, but a few risks should be reviewed before launch.";
+  }
+
+  if (score >= 50) {
+    return "Your app needs fixes before launch. Prioritize critical and warning issues.";
+  }
+
+  return "Your app is not ready to launch. Fix critical issues first.";
+}
+
+type ChecklistStatus = "pass" | "needs-review" | "not-scanned";
+
+type ChecklistRow = {
+  label: string;
+  status: ChecklistStatus;
+  statusLabel: string;
+  description: string;
+};
+
+function getChecklistRows(report: OutputScanReport): ChecklistRow[] {
+  const counts = getIssueCounts(report);
+  const apiChecked = report.checks.includes("api");
+  const environmentChecked = report.checks.includes("environment");
+  const webhookChecked = report.checks.includes("webhook");
+
+  const apiHasIssues = hasIssuesByCategory(report, "api", "security");
+  const environmentHasIssues = hasIssuesByCategory(report, "environment");
+  const webhookHasIssues = hasIssuesByCategory(report, "webhook");
+  const publicFormHasIssues = hasIssueByRuleId(report, "public-form-missing-abuse-protection");
+
+  const apiStatus: ChecklistStatus = !apiChecked ? "not-scanned" : apiHasIssues ? "needs-review" : "pass";
+  const environmentStatus: ChecklistStatus = !environmentChecked
+    ? "not-scanned"
+    : environmentHasIssues ? "needs-review" : "pass";
+  const webhookStatus: ChecklistStatus = !webhookChecked
+    ? "not-scanned"
+    : webhookHasIssues ? "needs-review" : "pass";
+  const publicFormStatus: ChecklistStatus = !apiChecked
+    ? "not-scanned"
+    : publicFormHasIssues ? "needs-review" : "pass";
+
+  return [
+    {
+      label: "Critical blockers",
+      status: counts.critical === 0 ? "pass" : "needs-review",
+      statusLabel: counts.critical === 0 ? "Pass" : "Needs review",
+      description:
+        counts.critical === 0
+          ? "No critical blockers detected in this scan."
+          : `${counts.critical} critical ${counts.critical === 1 ? "issue" : "issues"} to review.`
+    },
+    {
+      label: "API route review",
+      status: apiStatus,
+      statusLabel: getChecklistStatusLabel(apiStatus),
+      description: getChecklistDescription(
+        apiStatus,
+        "API and security checks did not surface issues.",
+        "API and security checks flagged routes to review.",
+        "API check was not part of this scan."
+      )
+    },
+    {
+      label: "Environment variables",
+      status: environmentStatus,
+      statusLabel: getChecklistStatusLabel(environmentStatus),
+      description: getChecklistDescription(
+        environmentStatus,
+        "Environment variable checks did not surface issues.",
+        "Environment variable checks flagged items to review.",
+        "Environment check was not part of this scan."
+      )
+    },
+    {
+      label: "Webhooks",
+      status: webhookStatus,
+      statusLabel: getChecklistStatusLabel(webhookStatus),
+      description: getChecklistDescription(
+        webhookStatus,
+        "Webhook checks did not surface issues.",
+        "Webhook checks flagged items to review.",
+        "Webhook check was not part of this scan."
+      )
+    },
+    {
+      label: "Public forms",
+      status: publicFormStatus,
+      statusLabel: getChecklistStatusLabel(publicFormStatus),
+      description: getChecklistDescription(
+        publicFormStatus,
+        "Public form abuse-protection checks did not surface issues.",
+        "Public form abuse-protection checks flagged forms to review.",
+        "Public forms are scanned as part of the API check, which was not selected."
+      )
+    }
+  ];
+}
+
+function getChecklistStatusLabel(status: ChecklistStatus): string {
+  if (status === "pass") {
+    return "Pass";
+  }
+
+  if (status === "needs-review") {
+    return "Needs review";
+  }
+
+  return "Not scanned";
+}
+
+function getChecklistDescription(
+  status: ChecklistStatus,
+  passText: string,
+  needsReviewText: string,
+  notScannedText: string
+): string {
+  if (status === "pass") {
+    return passText;
+  }
+
+  if (status === "needs-review") {
+    return needsReviewText;
+  }
+
+  return notScannedText;
+}
+
+function renderHtmlBadge(text: string, variant: string): string {
+  return `<span class="badge badge-${escapeHtml(variant)}">${escapeHtml(text)}</span>`;
+}
+
+function renderHtmlLaunchChecklist(report: OutputScanReport): string {
+  const rows = getChecklistRows(report);
+
+  const rowsHtml = rows
+    .map((row) =>
+      `        <li class="checklist-row checklist-${row.status}">
+          <span class="checklist-status status-${row.status}">${escapeHtml(row.statusLabel)}</span>
+          <div class="checklist-text">
+            <span class="checklist-label">${escapeHtml(row.label)}</span>
+            <span class="checklist-description">${escapeHtml(row.description)}</span>
+          </div>
+        </li>`
+    )
+    .join("\n");
+
+  return `    <section class="card" aria-labelledby="launch-checklist">
+      <h2 id="launch-checklist">Launch Checklist</h2>
+      <p class="muted card-subtitle">A quick view of which launch areas Qodfy looked at in this scan.</p>
+      <ul class="checklist">
+${rowsHtml}
+      </ul>
+    </section>`;
+}
+
+function renderHtmlEmptyState(): string {
+  const checks = [
+    "No issues detected in the selected scan mode.",
+    "Report generated locally.",
+    "No secret values printed."
+  ];
+
+  const checksHtml = checks
+    .map(
+      (item) =>
+        `          <li><span class="empty-check-icon" aria-hidden="true">&#10003;</span><span>${escapeHtml(item)}</span></li>`
+    )
+    .join("\n");
+
+  return `      <div class="empty-state">
+        <div class="empty-state-glyph" aria-hidden="true">&#10003;</div>
+        <h3 class="empty-state-title">No launch blockers found</h3>
+        <p class="empty-state-text">Qodfy did not detect critical, warning, or info issues in this scan. Do a final manual review before launch.</p>
+        <ul class="empty-state-checks">
+${checksHtml}
+        </ul>
+      </div>`;
+}
+
 function renderHtmlReport(report: OutputScanReport): string {
   const projectName = path.basename(report.projectPath) || report.projectPath;
   const statusLabel = getStatusLabel(report.score);
   const statusTone = getStatusTone(report.score);
-  const criticalCount = countIssuesBySeverity(report.issues, "critical");
-  const warningCount = countIssuesBySeverity(report.issues, "warning");
-  const infoCount = countIssuesBySeverity(report.issues, "info");
+  const scoreDescription = getScoreDescription(report.score);
+  const counts = getIssueCounts(report);
   const executiveSummary = getExecutiveSummary(report);
   const priorities = getTopPriorities(report.issues);
   const observations = getWhatLooksGood(report);
@@ -779,17 +1120,18 @@ function renderHtmlReport(report: OutputScanReport): string {
   const severityOrder: IssueSeverity[] = ["critical", "warning", "info"];
 
   const summaryCards = [
-    { label: "Critical issues", value: criticalCount, tone: criticalCount > 0 ? "critical" : "neutral" },
-    { label: "Warnings", value: warningCount, tone: warningCount > 0 ? "warning" : "neutral" },
-    { label: "Info", value: infoCount, tone: infoCount > 0 ? "info" : "neutral" },
+    { label: "Critical", value: counts.critical, tone: counts.critical > 0 ? "critical" : "neutral" },
+    { label: "Warnings", value: counts.warning, tone: counts.warning > 0 ? "warning" : "neutral" },
+    { label: "Info", value: counts.info, tone: counts.info > 0 ? "info" : "neutral" },
     { label: "Files scanned", value: report.stats.totalFiles, tone: "neutral" },
     { label: "API routes", value: report.stats.apiRoutes, tone: "neutral" },
     { label: "Scan duration", value: formatDuration(report.stats.durationMs), tone: "neutral" }
   ];
 
   const summaryCardsHtml = summaryCards
-    .map((card) =>
-      `        <div class="stat-card stat-${card.tone}">
+    .map(
+      (card) =>
+        `        <div class="stat-card stat-${card.tone}">
           <div class="stat-label">${escapeHtml(card.label)}</div>
           <div class="stat-value">${escapeHtml(String(card.value))}</div>
         </div>`
@@ -802,14 +1144,21 @@ function renderHtmlReport(report: OutputScanReport): string {
 
   const observationsHtml = observations.length === 0
     ? `<p class="muted">No positive observations to highlight from this scan.</p>`
-    : `<ul class="observation-list">\n${observations.map((observation) => `          <li>${escapeHtml(observation)}</li>`).join("\n")}\n        </ul>`;
+    : `<ul class="observation-list">\n${observations
+        .map(
+          (observation) =>
+            `          <li><span class="observation-icon" aria-hidden="true">&#10003;</span><span>${escapeHtml(observation)}</span></li>`
+        )
+        .join("\n")}\n        </ul>`;
 
   const issueSectionsHtml = report.issues.length === 0
-    ? `<p class="muted">No issues found.</p>`
+    ? renderHtmlEmptyState()
     : severityOrder
         .map((severity) => renderHtmlSeveritySection(severity, sortedIssues.filter((issue) => issue.severity === severity)))
         .filter(Boolean)
         .join("\n");
+
+  const launchChecklistHtml = renderHtmlLaunchChecklist(report);
 
   return `<!doctype html>
 <html lang="en">
@@ -823,17 +1172,29 @@ function renderHtmlReport(report: OutputScanReport): string {
 <body>
   <main class="page">
     <header class="hero">
-      <p class="eyebrow">Qodfy</p>
-      <h1>Launch Readiness Report</h1>
-      <dl class="hero-meta">
-        <div><dt>Project</dt><dd>${escapeHtml(projectName)}</dd></div>
-        <div><dt>Path</dt><dd><code>${escapeHtml(report.projectPath)}</code></dd></div>
-        <div><dt>Scan mode</dt><dd>${escapeHtml(report.scanMode)}</dd></div>
-        <div><dt>Generated</dt><dd>${escapeHtml(report.generatedAt)}</dd></div>
-      </dl>
+      <div class="hero-brand">
+        <div class="brand-badge">
+          <span class="brand-mark" aria-hidden="true">Q</span>
+          <span class="brand-text">Qodfy</span>
+        </div>
+        <span class="hero-tag">Launch Readiness</span>
+      </div>
+      <div class="hero-content">
+        <h1 class="hero-title">Launch Readiness Report</h1>
+        <p class="hero-subtitle">A local pre-launch scan for AI-built apps.</p>
+        <dl class="hero-meta">
+          <div><dt>Project</dt><dd>${escapeHtml(projectName)}</dd></div>
+          <div><dt>Generated</dt><dd>${escapeHtml(report.generatedAt)}</dd></div>
+          <div><dt>Scan mode</dt><dd>${escapeHtml(report.scanMode)}</dd></div>
+          <div><dt>Path</dt><dd><code>${escapeHtml(report.projectPath)}</code></dd></div>
+        </dl>
+      </div>
       <div class="score-card score-${statusTone}">
-        <div class="score-value">${escapeHtml(String(report.score))}<span class="score-max">/100</span></div>
-        <div class="score-status">${escapeHtml(statusLabel)}</div>
+        <div class="score-display">
+          <div class="score-value">${escapeHtml(String(report.score))}<span class="score-max">/100</span></div>
+          <div class="score-pill">${escapeHtml(statusLabel)}</div>
+        </div>
+        <p class="score-description">${escapeHtml(scoreDescription)}</p>
       </div>
     </header>
 
@@ -851,13 +1212,15 @@ ${summaryCardsHtml}
       ${prioritiesHtml}
     </section>
 
+${launchChecklistHtml}
+
     <section class="card" aria-labelledby="what-looks-good">
       <h2 id="what-looks-good">What Looks Good</h2>
       ${observationsHtml}
     </section>
 
     <section aria-labelledby="issues-by-priority">
-      <h2 id="issues-by-priority">Issues by Priority</h2>
+      <h2 id="issues-by-priority" class="section-heading">Issues by Priority</h2>
       ${issueSectionsHtml}
     </section>
 
@@ -872,8 +1235,9 @@ ${summaryCardsHtml}
     </section>
 
     <footer class="footer">
-      <p><strong>Generated by Qodfy.</strong></p>
+      <p class="footer-strong">Generated by Qodfy.</p>
       <p class="muted">Qodfy scans locally and does not print secret values in reports.</p>
+      <p class="muted">This report is a launch-readiness aid, not a replacement for a full security review.</p>
     </footer>
   </main>
 </body>
@@ -921,10 +1285,10 @@ function renderHtmlIssueCard(issue: Issue): string {
   const tests = getAfterFixTests(issue);
   const testsHtml = tests.length === 0
     ? `<p class="muted">No specific tests suggested.</p>`
-    : `<ul>\n${tests.map((test) => `              <li>${escapeHtml(test)}</li>`).join("\n")}\n            </ul>`;
+    : `<ul class="test-list">\n${tests.map((test) => `              <li>${escapeHtml(test)}</li>`).join("\n")}\n            </ul>`;
 
   const fileLine = issue.file
-    ? `<div class="meta-row"><span class="meta-label">File</span><code class="meta-value">${escapeHtml(issue.file)}</code></div>`
+    ? `<div class="meta-row meta-row-file"><span class="meta-label">File</span><code class="file-pill">${escapeHtml(issue.file)}</code></div>`
     : "";
 
   const suggestion = issue.suggestion ?? "No specific suggestion provided for this rule yet.";
@@ -933,9 +1297,9 @@ function renderHtmlIssueCard(issue: Issue): string {
   return `        <article class="issue-card issue-${issue.severity}" aria-labelledby="issue-${escapeHtml(issue.id)}-title">
           <header class="issue-header">
             <div class="issue-badges">
-              <span class="badge badge-${issue.severity}">${escapeHtml(issue.severity.toUpperCase())}</span>
-              <span class="badge badge-confidence badge-confidence-${issue.confidence}">Confidence: ${escapeHtml(issue.confidence)}</span>
-              <span class="badge badge-category">${escapeHtml(categoryLabels[issue.category])}</span>
+              ${renderHtmlBadge(issue.severity.toUpperCase(), issue.severity)}
+              ${renderHtmlBadge(`Confidence: ${issue.confidence}`, `confidence badge-confidence-${issue.confidence}`)}
+              ${renderHtmlBadge(categoryLabels[issue.category], "category")}
             </div>
             <h4 id="issue-${escapeHtml(issue.id)}-title" class="issue-title">${escapeHtml(issue.title)}</h4>
             <div class="issue-meta">
@@ -971,6 +1335,7 @@ function renderHtmlIssueCard(issue: Issue): string {
 
           <section class="issue-section">
             <h5>AI Fix Prompt</h5>
+            <p class="prompt-hint muted">Copy this into Cursor, ChatGPT, Claude, or Windsurf.</p>
             <pre class="code-block"><code>${escapeHtml(fixPrompt)}</code></pre>
           </section>
 
@@ -1019,175 +1384,383 @@ function getHtmlReportStyles(): string {
     body {
       margin: 0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: #f6f7fb;
-      color: #1f2330;
+      background: linear-gradient(180deg, #eef1f8 0%, #f6f7fb 280px, #f6f7fb 100%);
+      background-attachment: fixed;
+      color: #0f172a;
       line-height: 1.55;
+      font-size: 15px;
     }
     code, pre {
       font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     }
     .page {
-      max-width: 960px;
+      max-width: 1040px;
       margin: 0 auto;
-      padding: 32px 20px 64px;
+      padding: 40px 24px 80px;
     }
-    .eyebrow {
-      margin: 0 0 4px;
-      font-size: 12px;
-      font-weight: 600;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: #5b6478;
-    }
-    h1 {
-      margin: 0 0 16px;
-      font-size: 28px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-    }
-    h2 {
-      margin: 0 0 12px;
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: -0.005em;
-    }
-    h3 {
-      margin: 0 0 12px;
-      font-size: 16px;
-      font-weight: 700;
-    }
-    h4 {
-      margin: 0 0 8px;
-      font-size: 16px;
-      font-weight: 600;
-    }
-    h5 {
-      margin: 16px 0 6px;
-      font-size: 13px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: #5b6478;
-    }
+    h1, h2, h3, h4, h5 { color: #0f172a; }
     p { margin: 0 0 12px; }
     p:last-child { margin-bottom: 0; }
     ul, ol { margin: 0 0 12px; padding-left: 22px; }
     ul li, ol li { margin: 4px 0; }
-    .muted { color: #6b7384; }
+    .muted { color: #64748b; }
+    .card-subtitle { margin: -4px 0 16px; font-size: 13.5px; }
+    .section-heading {
+      margin: 8px 0 14px;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.005em;
+    }
+
+    /* Hero */
     .hero {
-      background: #ffffff;
+      background: linear-gradient(135deg, #ffffff 0%, #fbfcff 100%);
       border: 1px solid #e6e8ef;
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-      margin-bottom: 20px;
+      border-radius: 20px;
+      padding: 32px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 12px 32px -20px rgba(15, 23, 42, 0.08);
+      margin-bottom: 24px;
       display: grid;
-      gap: 16px;
+      gap: 22px;
+    }
+    .hero-brand {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .brand-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 5px 14px 5px 5px;
+      border-radius: 999px;
+      background: #0f172a;
+      color: #f8fafc;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+    .brand-mark {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, #6366f1, #4338ca);
+      color: #ffffff;
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .brand-text { letter-spacing: 0.02em; }
+    .hero-tag {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #475569;
+      background: #eef0f5;
+      padding: 5px 12px;
+      border-radius: 999px;
+    }
+    .hero-title {
+      margin: 0 0 6px;
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+    }
+    .hero-subtitle {
+      margin: 0 0 22px;
+      font-size: 15px;
+      color: #475569;
     }
     .hero-meta {
       margin: 0;
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px 24px;
+      gap: 14px 28px;
     }
-    .hero-meta div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .hero-meta div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
     .hero-meta dt {
       font-size: 11px;
-      font-weight: 600;
+      font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: #5b6478;
+      color: #64748b;
     }
     .hero-meta dd {
       margin: 0;
       font-size: 14px;
-      color: #1f2330;
+      color: #0f172a;
       word-break: break-word;
     }
     .hero-meta code {
       font-size: 12px;
       background: #f1f3f8;
-      padding: 2px 6px;
+      padding: 3px 8px;
       border-radius: 6px;
+      color: #1f2937;
     }
+
+    /* Score card */
     .score-card {
-      border-radius: 12px;
-      padding: 16px 20px;
+      border-radius: 16px;
+      padding: 22px 24px;
+      border: 1px solid transparent;
+      display: grid;
+      gap: 12px;
+    }
+    .score-display {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      border: 1px solid transparent;
+      flex-wrap: wrap;
     }
     .score-card .score-value {
-      font-size: 36px;
-      font-weight: 700;
-      letter-spacing: -0.02em;
+      font-size: 44px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1;
     }
     .score-card .score-max {
       font-size: 18px;
-      font-weight: 500;
-      color: #5b6478;
-      margin-left: 2px;
-    }
-    .score-card .score-status {
-      font-size: 14px;
       font-weight: 600;
-      padding: 6px 10px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.6);
+      color: #64748b;
+      margin-left: 4px;
     }
-    .score-ready { background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }
-    .score-ready .score-status { background: #d1fae5; color: #065f46; }
-    .score-almost { background: #f0f9ff; border-color: #bae6fd; color: #075985; }
-    .score-almost .score-status { background: #e0f2fe; color: #075985; }
-    .score-needs-fixes { background: #fffbeb; border-color: #fcd34d; color: #92400e; }
-    .score-needs-fixes .score-status { background: #fef3c7; color: #92400e; }
-    .score-not-ready { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
-    .score-not-ready .score-status { background: #fee2e2; color: #991b1b; }
+    .score-card .score-pill {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.7);
+    }
+    .score-description {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 500;
+      opacity: 0.92;
+    }
+    .score-ready { background: linear-gradient(135deg, #ecfdf5 0%, #f0fdf4 100%); border-color: #a7f3d0; color: #065f46; }
+    .score-ready .score-pill { background: #d1fae5; color: #065f46; }
+    .score-almost { background: linear-gradient(135deg, #f0f9ff 0%, #eff6ff 100%); border-color: #bae6fd; color: #075985; }
+    .score-almost .score-pill { background: #e0f2fe; color: #075985; }
+    .score-needs-fixes { background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%); border-color: #fcd34d; color: #92400e; }
+    .score-needs-fixes .score-pill { background: #fef3c7; color: #92400e; }
+    .score-not-ready { background: linear-gradient(135deg, #fef2f2 0%, #fff1f2 100%); border-color: #fecaca; color: #991b1b; }
+    .score-not-ready .score-pill { background: #fee2e2; color: #991b1b; }
+
+    /* Stats */
     .stats {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 20px;
+      gap: 14px;
+      margin-bottom: 24px;
     }
     .stat-card {
       background: #ffffff;
       border: 1px solid #e6e8ef;
-      border-radius: 12px;
-      padding: 14px 16px;
+      border-radius: 14px;
+      padding: 18px 20px;
       box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
     }
     .stat-label {
       font-size: 11px;
-      font-weight: 600;
+      font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: #5b6478;
+      color: #64748b;
     }
     .stat-value {
-      margin-top: 4px;
-      font-size: 22px;
+      margin-top: 6px;
+      font-size: 26px;
       font-weight: 700;
       letter-spacing: -0.01em;
+      line-height: 1.1;
     }
     .stat-critical .stat-value { color: #b91c1c; }
     .stat-warning .stat-value { color: #b45309; }
     .stat-info .stat-value { color: #1d4ed8; }
+
+    /* Card */
     .card {
       background: #ffffff;
       border: 1px solid #e6e8ef;
-      border-radius: 12px;
-      padding: 20px;
+      border-radius: 16px;
+      padding: 24px;
       margin-bottom: 16px;
       box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
     }
-    .priority-list, .observation-list { margin-bottom: 0; }
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: -0.005em;
+    }
+
+    /* Priority list */
+    .priority-list { padding-left: 22px; margin: 0; }
+    .priority-list li { margin: 6px 0; }
+
+    /* Observation list (What Looks Good) */
+    .observation-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .observation-list li {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      font-size: 14px;
+      color: #1f2937;
+    }
+    .observation-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      background: #dcfce7;
+      color: #166534;
+      font-size: 12px;
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+
+    /* Launch checklist */
+    .checklist {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 10px;
+    }
+    .checklist-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: #fbfcff;
+      border: 1px solid #eef0f5;
+      margin: 0;
+    }
+    .checklist-status {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 5px 10px;
+      border-radius: 999px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .status-pass { background: #dcfce7; color: #166534; }
+    .status-needs-review { background: #fef3c7; color: #92400e; }
+    .status-not-scanned { background: #eef0f5; color: #475569; }
+    .checklist-text {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .checklist-label {
+      font-size: 14px;
+      font-weight: 600;
+      color: #0f172a;
+    }
+    .checklist-description {
+      font-size: 13px;
+      color: #64748b;
+    }
+
+    /* Empty state */
+    .empty-state {
+      background: #ffffff;
+      border: 1px solid #e6e8ef;
+      border-radius: 18px;
+      padding: 44px 32px;
+      text-align: center;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .empty-state-glyph {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 60px;
+      height: 60px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, #d1fae5, #a7f3d0);
+      color: #065f46;
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 14px;
+    }
+    .empty-state-title {
+      margin: 0 0 10px;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .empty-state-text {
+      margin: 0 auto 22px;
+      max-width: 520px;
+      color: #475569;
+    }
+    .empty-state-checks {
+      list-style: none;
+      margin: 0 auto;
+      padding: 0;
+      max-width: 380px;
+      display: grid;
+      gap: 8px;
+      text-align: left;
+    }
+    .empty-state-checks li {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: #f8fafc;
+      border: 1px solid #eef2f7;
+      font-size: 14px;
+      color: #1f2937;
+      margin: 0;
+    }
+    .empty-check-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      background: #dcfce7;
+      color: #166534;
+      font-size: 11px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    /* Severity sections */
     .severity-section {
       background: #ffffff;
       border: 1px solid #e6e8ef;
-      border-radius: 14px;
-      padding: 20px;
+      border-radius: 16px;
+      padding: 22px;
       margin-bottom: 16px;
       box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
     }
@@ -1195,8 +1768,8 @@ function getHtmlReportStyles(): string {
       display: flex;
       align-items: center;
       gap: 10px;
-      font-size: 18px;
-      margin-bottom: 16px;
+      font-size: 17px;
+      margin: 0 0 16px;
     }
     .severity-dot {
       width: 10px;
@@ -1208,34 +1781,37 @@ function getHtmlReportStyles(): string {
     .severity-critical .severity-dot { background: #dc2626; }
     .severity-warning .severity-dot { background: #d97706; }
     .severity-info .severity-dot { background: #2563eb; }
-    .severity-count { color: #6b7384; font-weight: 500; }
-    .category-group { margin-top: 16px; }
+    .severity-count { color: #64748b; font-weight: 500; }
+    .category-group { margin-top: 18px; }
     .category-group:first-of-type { margin-top: 0; }
     .category-heading {
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 700;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.1em;
       text-transform: uppercase;
-      color: #5b6478;
-      margin-bottom: 10px;
+      color: #64748b;
+      margin: 0 0 10px;
     }
+
+    /* Issue card */
     .issue-card {
       border: 1px solid #e6e8ef;
-      border-radius: 12px;
-      padding: 18px 20px;
-      margin-bottom: 12px;
-      background: #fbfbfd;
+      border-radius: 14px;
+      padding: 20px 22px;
+      margin-bottom: 14px;
+      background: #ffffff;
       border-left-width: 4px;
     }
-    .issue-critical { border-left-color: #dc2626; }
-    .issue-warning { border-left-color: #d97706; }
-    .issue-info { border-left-color: #2563eb; }
-    .issue-header { margin-bottom: 8px; }
+    .issue-card:last-child { margin-bottom: 0; }
+    .issue-critical { border-left-color: #dc2626; background: linear-gradient(180deg, #fffbfb 0%, #ffffff 80px); }
+    .issue-warning { border-left-color: #d97706; background: linear-gradient(180deg, #fffdf6 0%, #ffffff 80px); }
+    .issue-info { border-left-color: #2563eb; background: linear-gradient(180deg, #f8fbff 0%, #ffffff 80px); }
+    .issue-header { margin-bottom: 12px; }
     .issue-badges {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
     }
     .badge {
       display: inline-flex;
@@ -1244,10 +1820,10 @@ function getHtmlReportStyles(): string {
       font-size: 11px;
       font-weight: 700;
       letter-spacing: 0.04em;
-      padding: 3px 8px;
+      padding: 4px 10px;
       border-radius: 999px;
       background: #eef0f5;
-      color: #1f2330;
+      color: #1f2937;
       text-transform: uppercase;
     }
     .badge-critical { background: #fee2e2; color: #991b1b; }
@@ -1271,60 +1847,109 @@ function getHtmlReportStyles(): string {
       letter-spacing: 0;
     }
     .issue-title {
-      margin: 4px 0 8px;
-      font-size: 16px;
+      margin: 6px 0 10px;
+      font-size: 17px;
       font-weight: 700;
       color: #0f172a;
+      letter-spacing: -0.005em;
+      line-height: 1.35;
     }
     .issue-meta {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 6px 16px;
+      gap: 8px 18px;
     }
-    .meta-row { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+    .meta-row { display: flex; gap: 8px; align-items: baseline; min-width: 0; flex-wrap: wrap; }
     .meta-label {
       font-size: 11px;
       font-weight: 700;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: #5b6478;
+      color: #64748b;
+      flex-shrink: 0;
     }
     .meta-value {
       font-size: 12px;
       background: #f1f3f8;
-      padding: 2px 6px;
+      padding: 3px 8px;
       border-radius: 6px;
       word-break: break-all;
+      color: #1f2937;
     }
-    .issue-section { margin-top: 8px; }
-    .issue-section p { margin: 0; }
-    .evidence-list { margin: 0; }
-    .code-block {
-      margin: 0;
-      padding: 12px 14px;
+    .file-pill {
+      font-size: 12.5px;
       background: #0f172a;
       color: #e2e8f0;
-      border-radius: 10px;
+      padding: 4px 10px;
+      border-radius: 8px;
+      word-break: break-all;
+      max-width: 100%;
+      display: inline-block;
+    }
+    .meta-row-file { grid-column: 1 / -1; }
+    .issue-section { margin-top: 14px; }
+    .issue-section h5 {
+      margin: 0 0 6px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+    }
+    .issue-section p { margin: 0; }
+    .evidence-list, .test-list { margin: 0; padding-left: 20px; }
+    .evidence-list li, .test-list li { margin: 4px 0; }
+    .prompt-hint {
+      margin: 0 0 8px;
+      font-size: 12.5px;
+    }
+    .code-block {
+      margin: 0;
+      padding: 14px 16px;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 12px;
       overflow: auto;
       font-size: 12.5px;
-      line-height: 1.55;
+      line-height: 1.6;
       white-space: pre-wrap;
       word-break: break-word;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
     }
+
+    /* Footer */
     .footer {
-      margin-top: 24px;
-      padding: 20px;
-      border-radius: 12px;
+      margin-top: 28px;
+      padding: 22px 24px;
+      border-radius: 14px;
       background: #ffffff;
       border: 1px solid #e6e8ef;
       text-align: center;
     }
+    .footer-strong {
+      margin: 0 0 6px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #0f172a;
+    }
+    .footer p { margin: 0 0 4px; }
+    .footer p:last-child { margin-bottom: 0; }
+
+    /* Responsive */
     @media (max-width: 720px) {
-      .page { padding: 20px 14px 48px; }
-      h1 { font-size: 24px; }
+      body { font-size: 14.5px; }
+      .page { padding: 24px 16px 56px; }
+      .hero { padding: 24px; border-radius: 18px; }
+      .hero-title { font-size: 26px; }
       .hero-meta, .stats, .issue-meta { grid-template-columns: 1fr; }
-      .stats { gap: 8px; }
-      .score-card { flex-direction: column; align-items: flex-start; }
+      .stats { gap: 10px; }
+      .score-card { padding: 18px 20px; }
+      .score-display { flex-direction: column; align-items: flex-start; gap: 10px; }
+      .score-card .score-value { font-size: 38px; }
+      .checklist-row { flex-direction: column; align-items: flex-start; gap: 8px; padding: 14px; }
+      .empty-state { padding: 32px 20px; }
+      .card { padding: 20px; border-radius: 14px; }
+      .severity-section, .issue-card { padding: 18px; border-radius: 14px; }
     }
   `;
 }

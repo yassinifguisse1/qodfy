@@ -182,6 +182,20 @@ Generate a standalone HTML report:
 pnpm --filter qodfy exec tsx src/index.ts scan --path ../../apps/web --html qodfy-report.html
 ```
 
+Generate a standalone HTML report and open it in the default browser:
+
+```bash
+pnpm --filter qodfy exec tsx src/index.ts scan --path ../../apps/web --html qodfy-report.html --open
+```
+
+Preview an HTML report (writes to `.qodfy/qodfy-report.html` inside the scanned project and opens it):
+
+```bash
+pnpm --filter qodfy exec tsx src/index.ts scan --path ../../apps/web --preview
+```
+
+The HTML report is standalone and opens locally in your browser. It uses only inline CSS, no external CDN, no external fonts, no external images, and no JavaScript.
+
 Build all packages:
 
 ```bash

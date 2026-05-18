@@ -32,9 +32,21 @@ npx qodfy scan --report qodfy-report.md
 npx qodfy scan --html qodfy-report.html
 ```
 
+Generate an HTML report and open it in your default browser:
+
+```bash
+npx qodfy scan --html qodfy-report.html --open
+```
+
+Or preview a report directly without picking a path. Qodfy writes the HTML to `.qodfy/qodfy-report.html` inside the scanned project and opens it for you:
+
+```bash
+npx qodfy scan --preview
+```
+
 The Markdown report is the **Qodfy Launch Report**: a senior-engineer-style review with a launch status, executive summary, top priorities, what looks good, and per-issue context (what Qodfy found, why it matters, evidence, suggested fix, and an AI fix prompt).
 
-The HTML report is a standalone, self-contained file (inline CSS, no external CDN, no JavaScript) that you can open directly in a browser to share with teammates or clients.
+The HTML report is standalone and opens locally in your browser. It is a single self-contained file (inline CSS only, no external CDN, no external fonts, no external images, no JavaScript) with a launch readiness hero, score description, launch checklist, what-looks-good observations, polished issue cards, and AI fix prompts you can copy into Cursor, ChatGPT, Claude, or Windsurf.
 
 ## What Qodfy Checks Today
 
@@ -89,6 +101,8 @@ qodfy scan --json
 qodfy scan --json --output qodfy-report.json
 qodfy scan --report qodfy-report.md
 qodfy scan --html qodfy-report.html
+qodfy scan --html qodfy-report.html --open
+qodfy scan --preview
 qodfy --help
 qodfy --version
 ```
